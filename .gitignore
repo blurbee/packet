@@ -1,6 +1,7 @@
-*.log
-/wppsvr/config.yaml
-log
-run.lock
-wppsvr.db
-_pending
+2025-11-MPMP
+save2025-11-MPMP.zip
+/packet
+SCCoPIFO.forms
+wppdata
+*.syso
+dist

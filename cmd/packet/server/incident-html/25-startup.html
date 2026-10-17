@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <script> // data retrieval
+    let currentSeq = 0
+    async function fetchData() {
+      while (true) {
+        const params = new URLSearchParams({ dir: document.body.dataset.dir, seq: currentSeq })
+        const url = '/incident/log?' + params.toString()
+        const resp = await fetch2(url)
+        if (!resp.ok) {
+          openErrorDialog('Server Error', (await resp.text()) || resp.statusText)
+          return
+        }
+        const data = await resp.json()
+        currentSeq = data.seq
+        window.dispatchEvent(new CustomEvent('new-data', { detail: data.log }))
+        if (delayedChildAction) {
+          childAction(delayedChildAction, true)
+          delayedChildAction = null
+        }
+      }
+    }
+    async function watchConnection(dir) {
+      let connSeq = 0
+      while (true) {
+        const params = new URLSearchParams({ dir: dir, seq: connSeq })
+        const url = '/connect-progress?' + params.toString()
+        const resp = await fetch2(url)
+        if (resp.status === 410) {
+          window.dispatchEvent(new CustomEvent('conn-progress', { detail: null }))
+          return
+        }
+        if (!resp.ok) {
+          openErrorDialog('Server Error', (await resp.text() || resp.statusText))
+          return
+        }
+        const data = await resp.json()
+        connSeq = data.seq
+        window.dispatchEvent(new CustomEvent('conn-progress', { detail: data }))
+      }
+    }
+    function setViewFlags() {
+      const vf = document.body.dataset.viewFlags
+      grid.classList.add(vf.includes('F') ? 'full' : 'compact')
+      document.getElementById('m-view-compact').setChecked(!vf.includes('F'))
+      if (vf.includes('L')) document.documentElement.style.fontSize = '1.25em'
+      document.getElementById('m-view-large').setChecked(vf.includes('L'))
+      grid.showReceipts(vf.includes('R'))
+      document.getElementById('m-view-receipts').setChecked(vf.includes('R'))
+    }
+  </script>
+  <script> // window.onload
+    window.addEventListener('load', () => {
+      grid = document.querySelector('log-grid')
+      setupMenuHandlers()
+      setupManualReceiveDialog()
+      setupNewMessageDialog()
+      setupManualSendDialog()
+      setupErrorDialog()
+      setupEditLogEntryDialog()
+      setupDeleteMessageDialog()
+      setupReadyConfirmDialog()
+      setupSignICS309Dialog()
+      setViewFlags()
+      fetchData()
+    })
+  </script>
+</head>
+
+<body data-view-flags=".{{VIEWFLAGS}}"></body>
+
+</html>

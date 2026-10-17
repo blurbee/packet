@@ -1,192 +1,314 @@
 package incident
 
 import (
-	"errors"
-	"fmt"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/rothskeller/packet/envelope"
-	"github.com/rothskeller/packet/message"
-	"github.com/rothskeller/packet/xscmsg/delivrcpt"
-	"github.com/rothskeller/packet/xscmsg/readrcpt"
+	"github.com/rothskeller/packet/v4/errors"
+	"github.com/rothskeller/packet/v4/message"
+	"github.com/rothskeller/packet/v4/message/field"
+	"github.com/rothskeller/packet/v4/message/receipt"
 )
 
-type Warning struct{ err error }
+// ReceiveMessage takes a JustReceivedMessage received from JNOS and saves it
+// in the incident.  ReceiveMessage returns the delivery receipt that should be
+// sent for the message, if any; it is up to the caller to queue the delivery
+// receipt for sending.  It also returns the log entry for the received message.
+func (i *Incident) ReceiveMessage(msg *message.JustReceivedMessage) (dr *message.DraftMessage, le *LogEntry, err error) {
+	var handling string
 
-func (w Warning) Error() string { return w.err.Error() }
-func (w Warning) Unwrap() error { return w.err }
-
-// ReceiveMessage takes a raw message received from JNOS and saves it in the
-// incident. "bbs" and "area" are the names of the BBS from which the message
-// was retrieved and, if the message is a bulletin, the bulletin area from which
-// it was retrieved. "msgid" is the message ID pattern; a unique ID will be
-// given to the new message using this pattern if it needs one.  "opcall" and
-// "opname" are the operator call sign and name to put into the received
-// message.
-//
-// If the received message is a human-originated message, it will be returned as
-// "lmi", "env", and "msg".  If a delivery receipt should be sent for it, the
-// receipt is returned as "oenv" and "omsg".  (Note that the delivery receipt
-// has not been saved; the caller should do that after sending it.)
-//
-// If the received message is a receipt, it will be returned as "env" and "msg".
-// If the receipt can be matched against a previously sent message in the
-// incident, that previously sent message is returned as "lmi", "oenv", and
-// "omsg" are the message for which it is a receipt.
-//
-// If the received message has an error, "err" will be set and the other return
-// values will be zero.  If the received message has a warning, "err" will be
-// set to a Warning value, and the other return values will be set as above.
-func ReceiveMessage(raw, bbs, area, msgid, opcall, opname string) (
-	lmi string, env *envelope.Envelope, msg message.Message, oenv *envelope.Envelope, omsg message.Message, err error,
-) {
-	// Parse the message.
-	var body string
-	env, body, err = envelope.ParseRetrieved(raw, bbs, area)
-	if err != nil {
-		err = fmt.Errorf("parse retrieved message: %s", err)
-		return
+	// The received message might be a receipt.  Those are handled
+	// specially.
+	switch msg.Type() {
+	case receipt.DeliveryReceipt, receipt.ReadReceipt:
+		le, err = i.receiveReceiptMessage(&msg.ReceivedMessage)
+		return nil, le, err
 	}
-	msg = message.Decode(env, body)
-	if len(msg.Base().UnknownFields) != 0 {
-		err = Warning{fmt.Errorf("unknown fields in form: %s", strings.Join(msg.Base().UnknownFields, " "))}
+	// Create a log entry and assign a local message ID.
+	le = &LogEntry{
+		Ident:   i.nextLogIdent(),
+		Index:   len(i.Log),
+		Seq:     i.Seq,
+		Status:  StatusReceived,
+		Flags:   FUnread,
+		Time:    msg.RxDate(),
+		Subject: msg.Subject().EncodedSubject(),
 	}
-	// If it's a receipt, it's handled specially.
-	switch msg.(type) {
-	case *delivrcpt.DeliveryReceipt, *readrcpt.ReadReceipt:
-		lmi, oenv, omsg, err = recordReceipt(env, msg)
-		return
+	if le.LocalMsgID, err = i.nextMessageID(false); err != nil {
+		return nil, nil, err
 	}
-	// Assign a local message ID.  Put it, and the opcall/opname, into the
-	// message if it has fields for it.
-	lmi = UniqueMessageID(msgid)
-	if mb := msg.Base(); mb.FDestinationMsgID != nil {
-		*mb.FDestinationMsgID = lmi
+	le.ToMsgID = le.LocalMsgID
+	msg.SetLocalID(le.LocalMsgID)
+	if msg.Bulletin() {
+		le.Flags |= FBulletin
+		le.FromCall = strings.ToUpper(msg.RxArea())
+	} else {
+		le.FromCall, _, _ = strings.Cut(msg.From(), "@")
+		le.FromCall = strings.ToUpper(strings.TrimSpace(le.FromCall))
 	}
-	msg.SetOperator(opcall, opname, true)
+	// Put the local message ID and the operator information into the
+	// message fields if it has them.  Also extract the OMI and handling
+	// from the message fields, if any, for use in the log entry.
+	for f := range msg.Fields() {
+		switch f.Common() {
+		case "originMessageID":
+			le.FromMsgID = f.Value(msg)
+		case "destinationMessageID":
+			f.SetValue(msg, le.LocalMsgID)
+		case "handling":
+			handling = f.Value(msg)
+		case "operatorName":
+			f.SetValue(msg, i.Config.OpName)
+		case "operatorCall":
+			f.SetValue(msg, i.Config.OpCall)
+		case "operatorDate":
+			f.SetValue(msg, msg.RxDate().Format("01/02/2006"))
+		case "operatorTime":
+			f.SetValue(msg, msg.RxDate().Format("15:04"))
+		case "receiverSender":
+			f.SetValue(msg, "receiver")
+		case "operatorMethod":
+			f.SetValue(msg, "Other")
+		case "operatorMethodOther":
+			f.SetValue(msg, "Packet")
+		}
+	}
+	// Check the subject line for OMI and handling that we didn't get from
+	// the message body.  Then set log flags for the handling.
+	if le.FromMsgID == "" {
+		le.FromMsgID = msg.Subject().SubjectMessageID()
+	}
+	if handling == "" {
+		handling = msg.Subject().SubjectHandling()
+	}
+	switch handling {
+	case "IMMEDIATE":
+		le.Flags |= FImmediate
+	case "PRIORITY":
+		le.Flags |= FPriority
+	}
 	// Save the message.
-	var rmi string
-	if b := msg.Base(); b.FOriginMsgID != nil {
-		rmi = *b.FOriginMsgID
+	if err = i.saveMessage(msg, le); err != nil {
+		return nil, nil, err
 	}
-	if err2 := SaveMessage(lmi, rmi, env, msg, false, true); err2 != nil {
-		err = fmt.Errorf("save received %s: %s", lmi, err2)
-		return
+	// Add the log entry to the log.
+	i.Log = append(i.Log, le)
+	i.sortLog()
+	// Generate a delivery receipt if appropriate.  (It's up to the caller
+	// to send it or not.)
+	if !msg.Bulletin() && !msg.Autoresponse() && !i.Config.NoSendReceipts {
+		dr, _ = i.MakeDeliveryReceipt(msg, le)
 	}
-	if area != "" || env.Autoresponse { // bulletin, bounce: no delivery receipt
-		return
-	}
-	// Return delivery receipt.
-	dr := delivrcpt.New()
-	dr.LocalMessageID = lmi
-	dr.DeliveredTime = time.Now().Format("01/02/2006 15:04")
-	dr.MessageSubject = env.SubjectLine
-	dr.MessageTo = env.To
-	denv := new(envelope.Envelope)
-	denv.SubjectLine = dr.EncodeSubject()
-	denv.To = env.From
-	return lmi, env, msg, denv, dr, err
+	slog.Info("received message", "lid", le.LocalMsgID, "s", msg.Subject().EncodedSubject())
+	return dr, le, nil
 }
 
-// recordReceipt matches a received receipt with the corresponding outgoing
+// MakeDeliveryReceipt makes a delivery receipt for the supplied received
 // message.
-func recordReceipt(env *envelope.Envelope, msg message.Message) (
-	lmi string, oenv *envelope.Envelope, omsg message.Message, err error,
-) {
-	var (
-		subject string
-		to      string
-		rmi     string
-	)
+func (i *Incident) MakeDeliveryReceipt(msg message.Message, le *LogEntry) (dr *message.DraftMessage, err error) {
+	var date time.Time
+	var from string
+
 	switch msg := msg.(type) {
-	case *delivrcpt.DeliveryReceipt:
-		subject, to = msg.MessageSubject, msg.MessageTo
-		rmi = msg.LocalMessageID
-	case *readrcpt.ReadReceipt:
-		subject, to = msg.MessageSubject, msg.MessageTo
+	case *message.ReceivedMessage:
+		date = msg.RxDate()
+		from = msg.From()
+	case *message.JustReceivedMessage:
+		if msg.Autoresponse() {
+			return nil, errors.New("Delivery receipts are not appropriate for automatically generated messages.")
+		}
+		date = msg.RxDate()
+		from = msg.From()
+	case *message.DraftMessage, *message.SentMessage:
+		return nil, errors.New("Delivery receipts cannot be sent for outgoing messages.")
 	}
-	if subject != "" {
-		if lmi, err = subjectToLMI(subject); err != nil {
-			return "", nil, nil, err
+	if msg.Bulletin() {
+		return nil, errors.New("Delivery receipts are not appropriate for bulletins and notices.")
+	}
+	switch msg.Type() {
+	case receipt.DeliveryReceipt, receipt.ReadReceipt:
+		return nil, errors.New("Delivery receipts are not appropriate for receipt messages.")
+	}
+	for _, e := range i.Log {
+		if e.LocalMsgID == le.LocalMsgID && e.Flags&FIsReceipt != 0 {
+			return nil, errors.New("A delivery receipt has already been generated for this message.")
 		}
 	}
-	if lmi == "" {
-		if lmi, err = makeFakeSentMessage(subject, to, env); err != nil {
-			return "", nil, nil, err
-		}
+	if dr, err = receipt.NewDeliveryReceipt(from, msg.To(), msg.Subject().EncodedSubject(), le.LocalMsgID, date, ""); err != nil {
+		return nil, err
 	}
-	if lmi == "" {
-		return
-	}
-	if oenv, omsg, err = ReadMessage(lmi); err != nil {
-		err = fmt.Errorf("read message %s for receipt: %s", lmi, err)
-		return
-	}
-	if err = SaveReceipt(lmi, env, msg); err != nil {
-		err = fmt.Errorf("save receipt for %s: %s", lmi, err)
-		return
-	}
-	if rmi == "" {
-		return // read receipt, nothing more to do
-	}
-	if mb := msg.Base(); mb.FDestinationMsgID != nil && *mb.FDestinationMsgID == "" {
-		*mb.FDestinationMsgID = rmi
-	}
-	if err = SaveMessage(lmi, rmi, oenv, omsg, false, false); err != nil {
-		err = fmt.Errorf("add RMI: save message %s: %s", lmi, err)
-		return
-	}
-	return
+	return dr, nil
 }
 
-// subjectToLMI scans all sent messages in reverse chronological order looking
-// for one with the specified subject.  If found, it returns the LMI.
-func subjectToLMI(subject string) (lmi string, err error) {
-	lmis, err := AllLMIs()
-	if err != nil {
-		return "", err
+func (i *Incident) receiveReceiptMessage(rcpt *message.ReceivedMessage) (le *LogEntry, err error) {
+	// Create a log entry.
+	var rcptle = LogEntry{
+		Ident:   i.nextLogIdent(),
+		Index:   len(i.Log),
+		Seq:     i.Seq,
+		Status:  StatusReceived,
+		Flags:   FIsReceipt,
+		Time:    rcpt.RxDate(),
+		Subject: rcpt.Subject().EncodedSubject(),
 	}
-	for i := len(lmis) - 1; i >= 0; i-- {
-		lmi = lmis[i]
-		if env, _, err := readEnvelope(lmi, ""); err == nil &&
-			!env.IsReceived() && env.IsFinal() && env.SubjectLine == subject {
-			return lmi, nil
+	rcptle.FromCall, _, _ = strings.Cut(rcpt.From(), "@")
+	rcptle.FromCall = strings.ToUpper(strings.TrimSpace(rcptle.FromCall))
+	var smr = message.SentMessageReceipt{ReceiverAddress: rcpt.From()}
+	var subject string
+	if rcpt.MType == receipt.DeliveryReceipt {
+		drb := rcpt.Body().(*receipt.DeliveryReceiptBody)
+		smr.ReceiverMessageID = drb.LocalMessageID()
+		smr.ReceiptDate = drb.DeliveryTime()
+		subject = drb.MessageSubject()
+	} else {
+		rrb := rcpt.Body().(*receipt.ReadReceiptBody)
+		smr.ReceiptDate = rrb.ReadTime()
+		smr.HasBeenRead = true
+		subject = rrb.MessageSubject()
+	}
+	// Find the matching outgoing message, if any.
+	for idx := len(i.Log) - 1; idx >= 0; idx-- {
+		sentle := i.Log[idx]
+		if sentle.Status != StatusSent || sentle.Subject != subject {
+			continue
 		}
+		rcptle.LocalMsgID = sentle.LocalMsgID
+		// Read the message.
+		sent, err := i.GetMessageFromLogEntry(sentle)
+		if err != nil {
+			return nil, err
+		}
+		// Add the receipt information to the header.
+		sent.(*message.SentMessage).AddReceipt(smr)
+		// Add the destination message ID to the message if appropriate.
+		if smr.ReceiverMessageID != "" {
+			for f := range sent.Fields() {
+				if f.Common() == field.CDestinationMessageID {
+					if f.Value(sent) == "" {
+						f.SetValue(sent, smr.ReceiverMessageID)
+					}
+					break
+				}
+			}
+		}
+		sentle.Seq = i.Seq
+		if err = i.saveMessage(sent, sentle); err != nil {
+			return nil, err
+		}
+		slog.Info("added receipt info to sent message", "lmi", sentle.LocalMsgID)
+		// Find the log entry matching this particular recipient.
+		fromCall, _, _ := strings.Cut(rcpt.From(), "@")
+		for ; idx >= 0; idx-- {
+			sentle := i.Log[idx]
+			if sentle.Status != StatusSent || sentle.LocalMsgID != rcptle.LocalMsgID ||
+				!strings.EqualFold(fromCall, sentle.ToCall) || sentle.Flags&FHasReceipt != 0 || sentle.ToMsgID != "" {
+				continue
+			}
+			sentle.ToMsgID = smr.ReceiverMessageID
+			sentle.Flags |= FHasReceipt
+			sentle.Flags &^= FNeedsReceipt
+			sentle.Seq = i.Seq
+			break
+		}
+		if idx < 0 {
+			slog.Warn("receipt not matched to any known addressee of sent message")
+		}
+		break
 	}
-	return "", nil
+	if rcptle.LocalMsgID == "" {
+		slog.Warn("receipt not matched to any sent message")
+	}
+	// Save the receipt message.
+	if err = i.saveMessage(rcpt, &rcptle); err != nil {
+		return nil, err
+	}
+	// Add the log entry to the log.
+	i.Log = append(i.Log, &rcptle)
+	i.sortLog()
+	slog.Info("received receipt", "s", rcpt.Subject().EncodedSubject())
+	return &rcptle, nil
 }
 
-func makeFakeSentMessage(subject, to string, rcptenv *envelope.Envelope) (lmi string, err error) {
-	// Can we discern an LMI from the subject line of the message being
-	// receipted?
-	if lmi, _, _, _, _ = message.DecodeSubject(subject); !MsgIDRE.MatchString(lmi) {
-		return "", nil
+// AddReceivedMessage takes a ReceivedMessage read from a file and adds it to
+// the incident.  If unless overwriteOK is true, the filename derived from the
+// message's local ID must not exist.
+func (i *Incident) AddReceivedMessage(msg *message.ReceivedMessage, overwriteOK bool) (err error) {
+	var (
+		le       *LogEntry
+		handling string
+	)
+	// The received message might be a receipt.  Those are handled specially.
+	switch msg.Type() {
+	case receipt.DeliveryReceipt, receipt.ReadReceipt:
+		_, err = i.receiveReceiptMessage(msg)
+		return err
 	}
-	// Is that LMI available?  We don't already have something named that?
-	if _, err = os.Stat(lmi + ".txt"); !errors.Is(err, os.ErrNotExist) {
-		return "", nil
+	// Create a log entry and assign a local message ID.
+	le = &LogEntry{
+		Ident:   i.nextLogIdent(),
+		Index:   len(i.Log),
+		Seq:     i.Seq,
+		Status:  StatusReceived,
+		Flags:   FUnread,
+		Time:    msg.RxDate(),
+		Subject: msg.Subject().EncodedSubject(),
 	}
-	// Create a fake sent message.
-	env := new(envelope.Envelope)
-	env.Date = rcptenv.Date
-	env.From = rcptenv.To
-	env.SubjectLine = subject
-	env.To = to
-	content := env.RenderSaved(`**** MESSAGE CONTENTS UNKNOWN ****
-
-A receipt was received for a message with this ID, but that message was sent
-in a different incident or by different software.
-`)
-	// Save the message to its text file.
-	if err = os.WriteFile(lmi+".txt", []byte(content), 0666); err != nil {
-		return "", err
+	if msg.LocalID() != "" {
+		le.LocalMsgID = msg.LocalID()
+		if !overwriteOK {
+			fname := filepath.Join(i.Dir, le.LocalMsgID+".txt")
+			if _, err := os.Stat(fname); !os.IsNotExist(err) {
+				return errors.NewF("imported message has local ID %s which is already in use", le.LocalMsgID)
+			}
+		}
+	} else if le.LocalMsgID, err = i.nextMessageID(false); err != nil {
+		return err
 	}
-	// Set the modification time of the text file based on the envelope.
-	// (This allows AllLMIs to sort by file modification time.)
-	if !env.Date.IsZero() {
-		os.Chtimes(lmi+".txt", env.Date, env.Date) // error ignored
+	le.ToMsgID = le.LocalMsgID
+	if msg.Bulletin() {
+		le.Flags |= FBulletin
+		le.FromCall = strings.ToUpper(msg.RxArea())
+	} else {
+		le.FromCall, _, _ = strings.Cut(msg.From(), "@")
+		le.FromCall = strings.ToUpper(strings.TrimSpace(le.FromCall))
 	}
-	return lmi, nil
+	// Put the local message ID into the
+	// message fields if it has them.  Also extract the OMI and handling
+	// from the message fields, if any, for use in the log entry.
+	for f := range msg.Fields() {
+		switch f.Common() {
+		case "originMessageID":
+			le.FromMsgID = f.Value(msg)
+		case "destinationMessageID":
+			f.SetValue(msg, le.LocalMsgID)
+		case "handling":
+			handling = f.Value(msg)
+		}
+	}
+	// Check the subject line for OMI and handling that we didn't get from
+	// the message body.  Then set log flags for the handling.
+	if le.FromMsgID == "" {
+		le.FromMsgID = msg.Subject().SubjectMessageID()
+	}
+	if handling == "" {
+		handling = msg.Subject().SubjectHandling()
+	}
+	switch handling {
+	case "IMMEDIATE":
+		le.Flags |= FImmediate
+	case "PRIORITY":
+		le.Flags |= FPriority
+	}
+	// Save the message.
+	if err = i.saveMessage(msg, le); err != nil {
+		return err
+	}
+	// Add the log entry to the log.
+	i.Log = append(i.Log, le)
+	i.sortLog()
+	slog.Info("import received message", "lid", le.LocalMsgID, "s", msg.Subject().EncodedSubject())
+	return nil
 }

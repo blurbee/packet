@@ -1,86 +1,189 @@
 package message
 
-import "github.com/rothskeller/packet/envelope"
+import (
+	"cmp"
+	"fmt"
+	"iter"
+	"strings"
 
-// This file contains the definition of message.Type, the registry of message
-// types, and the Create and Decode calls that walk that registry.
+	"github.com/rothskeller/packet/v4/errors"
+	"github.com/rothskeller/packet/v4/message/msgifc"
+)
 
-// Type gives the details of a registered message type.
-type Type struct {
-	// Tag is the tag string that identifies the message type.
-	Tag string
-	// HTML is the HTML filename that identifies the type of form.  It is empty
-	// for messages that are not forms.
-	HTML string
-	// Version is the version number of the form.  It is empty for messages that
-	// are not forms.
-	Version string
-	// FieldOrder is an ordered list of form field tags.  When provided,
-	// generated forms list the fields in that order.  (Should any fields be
-	// omitted from the list, they are put at the start of the form, before
-	// those in the list.)  This is nil for messages that are not forms.
-	FieldOrder []string
-	// Name is the English name of the message type, in prose case.
-	Name string
-	// Article is the indefinite article to use before the Name when needed;
-	// it is always either "a" or "an".
-	Article string
-	// PDFBase is the PDF template (i.e., blank form) onto which we will
-	// render the field values to create a PDF rendering of the message.
-	PDFBase []byte
-	// create is the function to create a new outgoing message of this type, with
-	// appropriate default values for fields.  It is nil if new messages of this
-	// type are not supported.
-	create func() Message
+// MType is the interface satisfied by all messages types.
+type MType = msgifc.MType
+
+// EditableMType is the interface satisfied by a message type that allows
+// creation and editing of messages.
+type EditableMType = msgifc.EditableMType
+
+type EditHTMLVars = msgifc.EditHTMLVars
+
+// Warning wraps a non-fatal "error".
+type Warning struct{ Err error }
+
+func (w Warning) Error() string { return w.Err.Error() }
+func (w Warning) Unwrap() error { return w.Err }
+
+//-----------------------------------------------------------------------------
+
+// mtypes is the list of registered message types.
+type registeredMType struct {
+	mt       MType
+	fallback bool
 }
 
-// RegisteredTypes is a map from message type tag to Type structures for
-// all registered message types.  It should be treated as read-only; to register
-// a new type, call Register.
-var RegisteredTypes = make(map[string][]*Type)
+var mtypes []registeredMType
 
-// decodeFunctions is the ordered list of functions to call to try decoding a
-// message.
-var decodeFunctions []func(env *envelope.Envelope, body string, form *PIFOForm, pass int) Message
-
-// Register registers a message type.  The order of registration is significant
-// for decoding messages:  catch-all decoders (e.g. UnknownForm and PlainText)
-// must be registered last.  The decode function must examine the envelope,
-// body, and form (which may be nil); if they are correct for the message type,
-// it must return the decoded message; otherwise, it must return nil.
-func Register(mtype *Type, decode func(env *envelope.Envelope, body string, form *PIFOForm, pass int) Message, create func() Message) {
-	mtype.create = create
-	RegisteredTypes[mtype.Tag] = append(RegisteredTypes[mtype.Tag], mtype)
-	decodeFunctions = append(decodeFunctions, decode)
+// RegisterType registers a message type.
+func RegisterType(mt MType) error {
+	return registerType(mt, false)
 }
 
-// Create creates a new, outgoing message with the specified type tag and
-// version.  If version is empty, it creates the message with the first-
-// registered version of the type (that supports message creation).  Create
-// returns nil if the type tag is not registered or does not support message
-// creation.  All message fields have default values for an outgoing message.
-func Create(tag, version string) Message {
-	for _, mtype := range RegisteredTypes[tag] {
-		if mtype.create != nil && (version == "" || version == mtype.Version) {
-			return mtype.create()
+// RegisterFallbackType registers a message type whose recognizer is guaranteed
+// to be called after all types registered with RegisterType, even if they are
+// registered later.
+func RegisterFallbackType(mt MType) error {
+	return registerType(mt, true)
+}
+
+func registerType(mt MType, fallback bool) error {
+	var tag, key string
+
+	if mt, ok := mt.(EditableMType); ok {
+		tag, key = strings.ToLower(mt.CreateTag()), strings.ToLower(mt.CreateKey())
+		if tag == "" {
+			return errors.New("editable message types must have a CreateTag")
 		}
-	}
-	return nil
-}
-
-// Decode decodes the supplied message and returns the typed, decoded message.
-// It returns nil if no registered type can decode the message.  (Between them,
-// the UnknownForm, Bulletin, and PlainText message types can decode any
-// message, so if they are registered, a nil return is not possible.)
-func Decode(env *envelope.Envelope, body string) (msg Message) {
-	// Decode the PIFO form in the message if any.
-	var form = DecodePIFO(body)
-	for pass := 1; pass <= 2; pass++ {
-		for _, fn := range decodeFunctions {
-			if msg = fn(env, body, form, pass); msg != nil {
-				return msg
+		for _, exist := range mtypes {
+			if exist, ok := exist.mt.(EditableMType); ok {
+				etag, ekey := strings.ToLower(exist.CreateTag()), strings.ToLower(exist.CreateKey())
+				if tag == etag {
+					return fmt.Errorf("the CreateTag %q is already in use", mt.CreateTag())
+				}
+				if key == etag {
+					return fmt.Errorf("the CreateKey %q is already in use", mt.CreateKey())
+				}
+				if key != "" && ekey != "" {
+					if strings.HasPrefix(key, ekey) || strings.HasPrefix(ekey, key) {
+						return fmt.Errorf("the CreateKey %q conflicts with another CreateKey %q", mt.CreateKey(), exist.CreateKey())
+					}
+				}
 			}
 		}
 	}
+	mtypes = append(mtypes, registeredMType{mt: mt, fallback: fallback})
 	return nil
 }
+
+// SetType determines the type of a Message and sets its Type property to the
+// first registered type whose Recognize method recognizes it, or otherwise to
+// PlainMessage.
+func SetType(m Message) {
+	if m.Type() != nil {
+		return
+	}
+	for mt := range AllTypes() {
+		mt.Recognize(m)
+		if m.Type() != nil {
+			return
+		}
+	}
+	m.SetType(PlainMessage)
+}
+
+// AllTypes returns an iterator on all of the registered message types.
+func AllTypes() iter.Seq[MType] {
+	return func(yield func(MType) bool) {
+		for _, mt := range mtypes {
+			if !mt.fallback && !yield(mt.mt) {
+				return
+			}
+		}
+		for _, mt := range mtypes {
+			if mt.fallback && !yield(mt.mt) {
+				return
+			}
+		}
+		yield(PlainMessage)
+	}
+}
+
+// FindType returns a registered message type that satisfies the supplied
+// predicate, or nil if none does.
+func FindType(pred func(MType) bool) MType {
+	for mt := range AllTypes() {
+		if pred(mt) {
+			return mt
+		}
+	}
+	return nil
+}
+
+// FindCreateTag returns the registered message type with the specified
+// CreateTag, or nil if none exists.
+func FindCreateTag(tag string) EditableMType {
+	for mt := range AllTypes() {
+		if emt, ok := mt.(EditableMType); ok && emt.CreateTag() == tag {
+			return emt
+		}
+	}
+	return nil
+}
+
+// CompareTypes returns -1/0/+1 for sorting a list of types.  Types are sorted
+// by name, except that plain text message always comes first.
+func CompareTypes(a, b MType) int {
+	if a == PlainMessage && b != PlainMessage {
+		return -1
+	}
+	if b == PlainMessage && a != PlainMessage {
+		return +1
+	}
+	an, bn := strings.ToLower(a.Name()), strings.ToLower(b.Name())
+	_, an, _ = strings.Cut(an, " ") // remove "a" or "an"
+	_, bn, _ = strings.Cut(bn, " ") // remove "a" or "an"
+	return cmp.Compare(an, bn)
+}
+
+//-----------------------------------------------------------------------------
+
+// BaseMType is a common core implementation for some message types.
+type BaseMType struct {
+	tag  string
+	name string
+}
+
+// NewBaseMType returns a new BaseMType with the specified name.
+func NewBaseMType(tag, name string) *BaseMType {
+	return &BaseMType{tag: tag, name: name}
+}
+
+func (t *BaseMType) Tag() string  { return t.tag }
+func (t *BaseMType) Name() string { return t.name }
+
+// RenderPDF creates a PDF representation of the message in the specified file.
+func (t *BaseMType) RenderPDF(m Message, filename, copyname string) (err error) {
+	return RenderPlainPDF(m, filename, copyname)
+}
+
+//-----------------------------------------------------------------------------
+
+// BaseEditableMType is a common core implementation for editable message
+// types.  Note that it is not a complete implementation; message types must
+// implement their own NewDraft and NewDraftCopy methods.
+type BaseEditableMType struct {
+	BaseMType
+	createTag string
+	createKey string
+}
+
+// NewBaseEditableMType returns a new BaseEditableMType with the specified
+// details to be returned by Name and CreateTag methods.
+func NewBaseEditableMType(name, createTag, createKey string) *BaseEditableMType {
+	return &BaseEditableMType{BaseMType: BaseMType{tag: createTag, name: name}, createTag: createTag, createKey: createKey}
+}
+
+func (t *BaseEditableMType) CreateTag() string { return t.createTag }
+
+func (t *BaseEditableMType) CreateKey() string { return t.createKey }

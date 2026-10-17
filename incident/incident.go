@@ -1,493 +1,392 @@
-// Package incident manages collections of related messages.
+// Package incident handles collections of messages stored in the same
+// directory.  Semantically, these are messages that belong to the same
+// incident, i.e., that are recorded on the same ICS-309 form.
 //
-// An incident is stored on disk as a directory of message files; each separate
-// incident is a separate directory.  Specifically, package incident always
-// works with the message files in the current working directory of the calling
-// program.
-//
-// Within the directory, each non-receipt message is stored in a file called
-// «LMI».txt, where «LMI» is the local message ID for the message.  If any
-// remote message IDs for the message are known, symbolic links name «RMI».txt
-// point to «LMI».txt.  (There may be multiple remote message IDs if the message
-// was sent to multiple recipients.)
-//
-// Messages are automatically rendered in PDF format if the message type
-// supports it and PDF rendering is built into the program; the PDF version is
-// stored in «LMI».pdf, with possible symbolic link from «RMI».pdf.
-//
-// Delivery and read receipts are stored in «LMI».DR#.txt and «LMI».RR#.txt,
-// respectively, where '#' is either absent or a serial number starting with 2.
-// (Multiple receipts may be received for a message if it was sent to multiple
-// recipients.)  There are no «RMI» symbolic links for those.
-//
-// On request, package incident can also generate an ICS-309 message log for the
-// messages in the directory.  This is stored in CSV format in ics309.csv, and
-// if PDF rendering is built into the program, it is rendered in PDF format in
-// ics309.pdf as well.  Both files are automatically removed when any message is
-// changed, so that the directory does not contain a stale log.
+// Incidents are identified by the full absolute path of their directory.
+// At a high level, there are only three operations one can perform:  Read,
+// Write, and Watch.  These are the three exported functions in this package.
 package incident
 
 import (
+	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
-	"regexp"
-	"sort"
-	"strconv"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/rothskeller/packet/envelope"
-	"github.com/rothskeller/packet/message"
-	"github.com/rothskeller/packet/xscmsg/delivrcpt"
-	"github.com/rothskeller/packet/xscmsg/readrcpt"
+	"github.com/fsnotify/fsnotify"
+	"github.com/rothskeller/packet/v4/cmd/packet/osdep"
 )
 
-// MsgIDRE is a regular expression matching a valid message ID.  Its substrings
-// are the three-character prefix, the three-or-more-digit sequence number, and
-// the optional suffix character.
-var MsgIDRE = regexp.MustCompile(`^([0-9][A-Z]{2}|[A-Z][A-Z0-9]{2})-([1-9][0-9]{2,}|0[1-9][0-9]|00[1-9])([A-Z]?)$`)
+const (
+	lockFileName = ".packet.lock"
+	jsonFileName = "packet.json"
+)
 
-// MessageExists returns true if a message exists with the specified LMI.
-func MessageExists(lmi string) bool {
-	if !MsgIDRE.MatchString(lmi) {
+var (
+	ErrNotIncident = errors.New("not a valid incident directory")
+)
+
+var (
+	watcher      *fsnotify.Watcher
+	watching     = map[string]chan struct{}{}
+	watcherMutex sync.Mutex
+)
+
+// An Incident is a collection of related messages stored in the same
+// directory.
+type Incident struct {
+	// Dir is the absolute path to the directory for the incident.
+	Dir string `json:"-"`
+	// Seq is the sequence number, incremented with every change to the
+	// incident.
+	Seq int `json:"seq"`
+	// Config is the configuration of the incident, i.e., the details that
+	// (usually) don't change over time.
+	Config *Config `json:"conf"`
+	// BulletinChecks is a map from bulletin area name to the time at which
+	// it was last checked.
+	BulletinChecks map[string]time.Time `json:"bull"`
+	// Log is an ordered list of log messages for the incident.  The first
+	// element is always nil so that the slice index equals the item Index.
+	Log []*LogEntry `json:"log"`
+}
+
+// IsIncident returns whether the named directory is an incident directory.
+// (This is mostly used when presenting the user with a list of past incidents,
+// to weed out past incident directories that no longer exist or no longer
+// contain incident data.)
+func IsIncident(dir string) bool {
+	if !filepath.IsAbs(dir) {
 		return false
 	}
-	if info, err := os.Stat(lmi + ".txt"); err == nil && info.Mode().IsRegular() {
+	if _, err := os.Stat(filepath.Join(dir, lockFileName)); err != nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(dir, jsonFileName)); err != nil {
+		return false
+	}
+	return true
+}
+
+// IsUnsafeIncidentDir returns whether the named directory is unsafe for use as
+// an incident directory.  Unsafe directories are the root directory of any
+// volume, the user's home directory, the Desktop or Documents subdirectory of
+// the user's home directory, or (on Windows) C:\PackItForms.  These are
+// considered unsafe because they are semantically too global to keep a single
+// incident in.
+func IsUnsafeIncidentDir(dir string) bool {
+	if dir == "" || dir == "/" || dir[1:] == `:\` || strings.EqualFold(dir[1:], `:\PackItForms`) {
 		return true
 	}
-	return false
+	home := os.Getenv("HOME")
+	if home == "" {
+		return false
+	}
+	// I'm doing case insensitive comparisons because Windows and Mac both
+	// have case insensitive pathnames.  If it causes a false positive on
+	// Linux, too bad.
+	home = strings.ToLower(home)
+	dir = strings.ToLower(dir)
+	if home == dir {
+		return true
+	}
+	home += string(filepath.Separator)
+	if !strings.HasPrefix(dir, home) {
+		return false
+	}
+	dir = strings.TrimPrefix(dir, home)
+	return dir == "desktop" || dir == "documents"
 }
 
-// LMIForRMI returns the LMI for the message with the given RMI, if any.  It
-// returns "" if the RMI doesn't exist.
-func LMIForRMI(rmi string) string {
+// Create creates a new incident in the named directory, which must not already
+// be an incident directory.  It calls the supplied function while holding the
+// write lock on the new incident.  If the supplied function returns nil, the
+// new incident is saved; otherwise, no change is made to the named directory
+// and the error is returned.
+func Create(dir string, fn func(*Incident) error) (err error) {
 	var (
-		info os.FileInfo
-		lmi  string
-		err  error
+		lockFH    *os.File
+		inc       *Incident
+		stateFile string
 	)
-	if !MsgIDRE.MatchString(rmi) {
-		return ""
+	if !filepath.IsAbs(dir) {
+		return ErrNotIncident
 	}
-	if info, err = os.Stat(rmi + ".txt"); err != nil || info.Mode().Type() != os.ModeSymlink {
-		return ""
-	}
-	if lmi, err = os.Readlink(rmi + ".txt"); err != nil || !strings.HasSuffix(lmi, ".txt") {
-		return ""
-	}
-	lmi = lmi[:len(lmi)-4]
-	if !MsgIDRE.MatchString(lmi) {
-		return ""
-	}
-	return lmi
-}
-
-// ReadMessage reads a message from the incident directory and returns it.
-func ReadMessage(lmi string) (env *envelope.Envelope, msg message.Message, err error) {
-	var body string
-
-	if env, body, err = readEnvelope(lmi, ""); err != nil {
-		return env, nil, err
-	}
-	msg = message.Decode(env, body)
-	return env, msg, nil
-}
-
-// ReadReceipt reads a receipt for a message.  rcpt must be "DR#" or "RR#".
-func ReadReceipt(lmi, rcpt string) (env *envelope.Envelope, msg message.Message, err error) {
-	var body string
-
-	if env, body, err = readEnvelope(lmi, rcpt); err != nil {
-		return env, nil, err
-	}
-	msg = message.Decode(env, body)
-	return env, msg, nil
-}
-
-func readEnvelope(lmi, rcpt string) (env *envelope.Envelope, body string, err error) {
-	var (
-		fname    string
-		contents []byte
-	)
-	if !MsgIDRE.MatchString(lmi) {
-		return nil, "", errors.New("invalid LMI")
-	}
-	fname = lmi
-	if rcpt != "" {
-		fname += "." + rcpt
-	}
-	fname += ".txt"
-	if contents, err = os.ReadFile(fname); err != nil {
-		return nil, "", err
-	}
-	if env, body, err = envelope.ParseSaved(string(contents)); err != nil {
-		return env, "", fmt.Errorf("stored message could not be parsed: %s", err)
-	}
-	return env, body, nil
-}
-
-// SaveMessage saves a (non-receipt) message to the incident directory,
-// overwriting any previous message stored with the same LMI.  If rmi is not
-// empty, an RMI symlink is created.  (Existing RMI symlinks are not disturbed.)
-// If fast is true, PDFs are not generated even when possible; stale PDFs are
-// removed.  If rawsubj is true, the envelope Subject: line is left unchanged
-// rather than being regenerated based on the message contents.
-func SaveMessage(lmi, rmi string, env *envelope.Envelope, msg message.Message, fast, rawsubj bool) (err error) {
-	if !MsgIDRE.MatchString(lmi) {
-		return errors.New("invalid LMI")
-	}
-	if rmi != "" && !MsgIDRE.MatchString(rmi) {
-		rmi = "" // ignore ill-formed RMIs
-	}
-	switch msg.(type) {
-	case *delivrcpt.DeliveryReceipt, *readrcpt.ReadReceipt:
-		panic("cannot call SaveMessage for receipt message; call SaveReceipt instead")
-	}
-	if rmi != "" {
-		return saveMessage(lmi+".txt", rmi+".txt", env, msg, fast, rawsubj)
-	}
-	return saveMessage(lmi+".txt", "", env, msg, fast, rawsubj)
-}
-
-// SaveReceipt saves a receipt message to the incident directory, with a unique
-// sequence number to avoid overwriting other receipts for the same message.
-func SaveReceipt(lmi string, env *envelope.Envelope, msg message.Message) (err error) {
-	var (
-		base     string
-		filename string
-		seq      = 1
-	)
-	if !MsgIDRE.MatchString(lmi) {
-		return errors.New("invalid LMI")
-	}
-	switch msg.(type) {
-	case *delivrcpt.DeliveryReceipt:
-		base = lmi + ".DR"
-	case *readrcpt.ReadReceipt:
-		base = lmi + ".RR"
-	default:
-		panic("cannot call SaveReceipt on a non-receipt message")
-	}
-	filename = base + ".txt"
-	for {
-		if _, err := os.Stat(filename); os.IsNotExist(err) {
-			break
-		} else {
-			seq++
-			filename = fmt.Sprintf("%s%d.txt", base, seq)
-		}
-	}
-	return saveMessage(filename, "", env, msg, true, true)
-}
-
-// saveMessage is the common code between SaveMessage and SaveReceipt.
-func saveMessage(filename, linkname string, env *envelope.Envelope, msg message.Message, fast, rawsubj bool) (err error) {
-	var (
-		content string
-		modtime time.Time
-	)
-	// Encode the message.
-	if !rawsubj {
-		env.SubjectLine = msg.EncodeSubject()
-	}
-	if b := msg.Base(); b.FHandling != nil && *b.FHandling == "IMMEDIATE" {
-		env.OutpostUrgent = true
-	} else {
-		env.OutpostUrgent = false
-	}
-	content = env.RenderSaved(msg.EncodeBody())
-	// Save the message to its text file.
-	if err = os.WriteFile(filename, []byte(content), 0666); err != nil {
+	if lockFH, err = os.OpenFile(filepath.Join(dir, lockFileName), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0666); err != nil {
 		return err
 	}
-	// Set the modification time of the text file based on the envelope.
-	// (This allows AllLMIs to sort by file modification time.)
-	if env.IsReceived() {
-		modtime = env.ReceivedDate
-	} else {
-		modtime = env.Date
+	if err = osdep.WriteLock(lockFH); err != nil {
+		lockFH.Close()
+		os.Remove(lockFH.Name())
+		return fmt.Errorf("write lock %s: %s", lockFH.Name(), err)
 	}
-	if !modtime.IsZero() {
-		os.Chtimes(filename, modtime, modtime) // error ignored
+	inc = &Incident{Dir: dir, Seq: 1, Config: configFromDefaults()}
+	if err = fn(inc); err != nil {
+		osdep.Unlock(lockFH)
+		lockFH.Close()
+		os.Remove(lockFH.Name())
+		return err
 	}
-	// Create the RMI symlink for the text file if needed.
-	if linkname != "" {
-		os.Symlink(filename, linkname) // error ignored
+	if err = inc.writeStateFile(); err != nil {
+		osdep.Unlock(lockFH)
+		lockFH.Close()
+		os.Remove(lockFH.Name())
+		return err
 	}
-	// Remove any generated ICS-309 since it's now potentially out of date.
-	RemoveICS309s()
-	// If the message can be rendered as PDF, do that.
-	filename = filename[:len(filename)-4] + ".pdf"
-	if fast {
-		os.Remove(filename)
-		if linkname != "" {
-			os.Remove(linkname[:len(linkname)-4] + ".pdf")
-		}
-		// This code could leave symlinks to nonexistent PDFs if there
-		// are RMI links other than linkname.  TODO
-	} else {
-		// Render the PDF.  Ignore errors (can't allow them to prevent
-		// us from saving a received message).
-		if err = msg.RenderPDF(env, filename); err == nil && linkname != "" {
-			linkname = linkname[:len(linkname)-4] + ".pdf"
-			os.Symlink(filename, linkname)
-		}
+	stateFile = filepath.Join(dir, jsonFileName)
+	if _, err = fmt.Fprintf(lockFH, "%08d", inc.Seq); err != nil {
+		os.Remove(stateFile)
+		osdep.Unlock(lockFH)
+		lockFH.Close()
+		os.Remove(lockFH.Name())
+		return fmt.Errorf("write %s: %s", lockFH.Name(), err)
+	}
+	if err = osdep.Unlock(lockFH); err != nil {
+		os.Remove(stateFile)
+		osdep.Unlock(lockFH)
+		lockFH.Close()
+		os.Remove(lockFH.Name())
+		return fmt.Errorf("unlock %s: %s", lockFH.Name(), err)
+	}
+	if err = lockFH.Close(); err != nil {
+		os.Remove(stateFile)
+		osdep.Unlock(lockFH)
+		lockFH.Close()
+		os.Remove(lockFH.Name())
+		return fmt.Errorf("close %s: %s", lockFH.Name(), err)
 	}
 	return nil
 }
 
-// RemoveMessage removes the message with the specified LMI.
-func RemoveMessage(lmi string) {
-	if !MsgIDRE.MatchString(lmi) {
-		panic("invalid LMI")
+// Read opens the incident in the named directory for read-only operations and
+// invokes the supplied function while holding the read lock.  Read returns any
+// error it encounters or any error returned by the supplied function.
+func Read(dir string, fn func(*Incident) error) (err error) {
+	var (
+		lockFH    *os.File
+		inc       *Incident
+		stateFile string
+	)
+	if !filepath.IsAbs(dir) {
+		slog.Error("not an incident directory", "dir", dir)
+		return ErrNotIncident
 	}
-	os.Remove(lmi + ".txt")
-	os.Remove(lmi + ".pdf")
-	// This code could leave RMI symlinks to the message.  But client code
-	// doesn't call this except for unsent messages, so it shouldn't be an
-	// issue.
+	if lockFH, err = os.Open(filepath.Join(dir, lockFileName)); err != nil {
+		slog.Error("open lock file", "lf", filepath.Join(dir, lockFileName), "err", err)
+		return err
+	}
+	defer lockFH.Close()
+	if err = osdep.ReadLock(lockFH); err != nil {
+		slog.Error("lock for read", "lf", lockFH.Name(), "err", err)
+		return fmt.Errorf("read lock %s: %s", lockFH.Name(), err)
+	}
+	defer osdep.Unlock(lockFH)
+	stateFile = filepath.Join(dir, jsonFileName)
+	if inc, err = readStateFile(stateFile); err != nil {
+		return err
+	}
+	inc.Dir = dir
+	if err = fn(inc); err != nil {
+		return err
+	}
+	return nil
 }
 
-// UniqueMessageID returns the provided message ID if there is no existing
-// message in the directory with that ID (local or remote).  Otherwise, it
-// increments the sequence number until the message ID is unused, and returns
-// the result.
-func UniqueMessageID(id string) string {
+// Write opens the incident in the named directory for write operations and
+// invokes the supplied function while holding the write lock.  If Write
+// encounters any error, it will return it.  If the supplied function returns
+// nil, any changes it made to the Incident will be applied.  If it returns an
+// error, no changes will be applied and Write will return the error.
+func Write(dir string, fn func(*Incident) error) (err error) {
 	var (
-		prefix string
-		seq    int
-		suffix string
+		lockFH    *os.File
+		inc       *Incident
+		stateFile string
 	)
-	if match := MsgIDRE.FindStringSubmatch(id); match != nil {
-		prefix, suffix = match[1], match[3]
-		seq, _ = strconv.Atoi(match[2])
-	} else {
-		panic("UniqueMessageID called for invalid ID")
+	if !filepath.IsAbs(dir) {
+		slog.Error("not an incident directory", "dir", dir)
+		return ErrNotIncident
 	}
+	if lockFH, err = os.OpenFile(filepath.Join(dir, lockFileName), os.O_RDWR, 0666); err != nil {
+		slog.Error("open lock file", "lf", filepath.Join(dir, lockFileName), "err", err)
+		return err
+	}
+	defer lockFH.Close()
+	if err = osdep.WriteLock(lockFH); err != nil {
+		slog.Error("lock for write", "lf", lockFH.Name(), "err", err)
+		return fmt.Errorf("write lock %s: %s", lockFH.Name(), err)
+	}
+	defer osdep.Unlock(lockFH)
+	stateFile = filepath.Join(dir, jsonFileName)
+	if inc, err = readStateFile(stateFile); err != nil {
+		return err
+	}
+	inc.Dir = dir
+	inc.Seq++
+	if err = fn(inc); err != nil {
+		return err
+	}
+	// Remove the generated ICS-309 file after any successful incident
+	// change.
+	os.Remove(filepath.Join(inc.Dir, "ics309.pdf"))
+	if err = inc.writeStateFile(); err != nil {
+		return err
+	}
+	if _, err = fmt.Fprintf(lockFH, "%08d", inc.Seq); err != nil {
+		slog.Error("write to lock file", "lf", lockFH.Name(), "err", err)
+		return fmt.Errorf("write %s: %s", lockFH.Name(), err)
+	}
+	if err = osdep.Unlock(lockFH); err != nil {
+		slog.Error("unlock", "lf", lockFH.Name(), "err", err)
+		return fmt.Errorf("unlock %s: %s", lockFH.Name(), err)
+	}
+	if err = lockFH.Close(); err != nil {
+		slog.Error("close lock file", "lf", lockFH.Name(), "err", err)
+		return fmt.Errorf("close %s: %s", lockFH.Name(), err)
+	}
+	return nil
+}
+
+// Watch monitors the incident in the named directory for changes.  It returns
+// nil when a change is observed or the stop channel (if any) is closed, and a
+// context error when the supplied context is canceled.  If seq is less than the
+// current sequence number of the incident, Watch returns nil immediately.
+func Watch(ctx context.Context, dir string, seq int, stop <-chan struct{}) (err error) {
+	var (
+		lockFile string
+		lockFH   *os.File
+		curr     int
+		ch       chan struct{}
+	)
+	if !IsIncident(dir) {
+		slog.Error("not an incident directory", "dir", dir)
+		return ErrNotIncident
+	}
+	// Open and lock the lock file.
+	lockFile = filepath.Join(dir, lockFileName)
+	if lockFH, err = os.Open(lockFile); err != nil {
+		slog.Error("open lock file", "lf", lockFile, "err", err)
+		return err
+	}
+	defer lockFH.Close()
+	if err = osdep.ReadLock(lockFH); err != nil {
+		slog.Error("read lock file", "lf", lockFile, "err", err)
+		return fmt.Errorf("read lock %s: %s", lockFile, err)
+	}
+	defer osdep.Unlock(lockFH)
+	// Read the sequence number from the lock file.  If it's old, the
+	// incident has already changed, and we return immediately.
+	if _, err = fmt.Fscanf(lockFH, "%d", &curr); err == nil && curr > seq {
+		return nil
+	}
+	// Make sure the watcher is created and running.
+	watcherMutex.Lock()
+	if watcher == nil {
+		if watcher, err = fsnotify.NewWatcher(); err != nil {
+			slog.Error("fsnotify.NewWatcher", "err", err)
+			watcherMutex.Unlock()
+			return fmt.Errorf("can't create watcher: %s", err)
+		}
+		go listenToWatcher()
+	}
+	// If there's already a channel for writes to this file, we'll use it.
+	if ch = watching[lockFile]; ch == nil {
+		ch = make(chan struct{})
+		watching[lockFile] = ch
+		// If not, we'll add this file to the watcher list and create
+		// a channel for it.
+		if err = watcher.Add(lockFile); err != nil {
+			slog.Error("watcher.Add", "f", lockFile, "err", err)
+			watcherMutex.Unlock()
+			return fmt.Errorf("can't watch %s: %s", lockFile, err)
+		}
+	}
+	watcherMutex.Unlock()
+	// Now that we're watching, we can release the lock on the lock file.
+	osdep.Unlock(lockFH)
+	lockFH.Close()
+	// Wait for the channel to be closed, indicating a write, or for the
+	// supplied context to be canceled.
+	select {
+	case <-stop:
+		return nil
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// listenToWatcher is the goroutine that handles events from the watcher.
+// If it gets a WRITE event for a file we're watching, it closes the
+// corresponding channel, which will wake up all other goroutines waiting on
+// it.
+func listenToWatcher() {
 	for {
-		if _, err := os.Stat(id + ".txt"); errors.Is(err, os.ErrNotExist) {
-			return id
-		}
-		seq++
-		id = fmt.Sprintf("%s-%03d%s", prefix, seq, suffix)
-	}
-}
-
-// AllLMIs returns a list of local message IDs of all messages in the directory.
-// The list is in chronological order.  An error is returned only if the
-// directory cannot be read.
-func AllLMIs() (lmis []string, err error) {
-	var (
-		dir   *os.File
-		files []os.FileInfo
-	)
-	if dir, err = os.Open("."); err != nil {
-		return nil, err
-	}
-	defer dir.Close()
-	if files, err = dir.Readdir(0); err != nil {
-		return nil, err
-	}
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].ModTime().Before(files[j].ModTime())
-	})
-	for _, fi := range files {
-		var lmi string
-
-		if !fi.Mode().IsRegular() {
-			continue
-		}
-		if !strings.HasSuffix(fi.Name(), ".txt") {
-			continue
-		}
-		lmi = fi.Name()[:len(fi.Name())-4]
-		if MsgIDRE.MatchString(lmi) {
-			lmis = append(lmis, lmi)
-		}
-	}
-	return lmis, nil
-}
-
-// SeqToLMI takes a sequence number and expands it to a list of existing message
-// LMIs with that sequence number.  If remote is true, the LMIs of messages
-// whose RMI has the requested sequence number are also included.  The LMIs are
-// returned in unspecified order.  An error is returned only if the directory
-// cannot be read.
-func SeqToLMI(seq int, remote bool) (lmis []string, err error) {
-	var (
-		dir    *os.File
-		files  []os.FileInfo
-		seqstr = fmt.Sprintf("%03d", seq)
-	)
-	if seq <= 0 {
-		panic("SeqToLMI sequence number must be positive")
-	}
-	if dir, err = os.Open("."); err != nil {
-		return nil, err
-	}
-	defer dir.Close()
-	if files, err = dir.Readdir(0); err != nil {
-		return nil, err
-	}
-	for _, fi := range files {
-		var mid string
-
-		if !strings.HasSuffix(fi.Name(), ".txt") {
-			continue
-		}
-		mid = fi.Name()[:len(fi.Name())-4]
-		if match := MsgIDRE.FindStringSubmatch(mid); match == nil || match[2] != seqstr {
-			continue
-		}
-		switch fi.Mode().Type() {
-		case 0: // regular file
-			lmis = append(lmis, mid)
-		case os.ModeSymlink:
-			var target string
-
-			if !remote {
-				break
+		select {
+		case ev := <-watcher.Events:
+			if ev.Has(fsnotify.Write) {
+				watcherMutex.Lock()
+				if ch := watching[ev.Name]; ch != nil {
+					close(ch)
+					delete(watching, ev.Name)
+				}
+				watcher.Remove(ev.Name)
+				watcherMutex.Unlock()
 			}
-			if target, err = os.Readlink(fi.Name()); err != nil {
-				break
-			}
-			if !strings.HasSuffix(target, ".txt") {
-				break
-			}
-			mid = target[:len(target)-4]
-			if MsgIDRE.MatchString(mid) {
-				lmis = append(lmis, mid)
-			}
+		case err := <-watcher.Errors:
+			slog.Error("watcher.Errors", "err", err)
 		}
 	}
-	return lmis, nil
 }
 
-// A DeliveryInfo structure describes the delivery of a message to a recipient.
-type DeliveryInfo struct {
-	// Recipient is the address of the recipient to which the message was
-	// addressed.  Display names are removed and domains are fleshed out.
-	Recipient string
-	// DeliveredTime is the date and time when the message was delivered to
-	// the recipient, as described in the delivery receipt they sent back.
-	// (It is a string because there is no standard time formatting for this
-	// delivery receipt field.)  It is empty if no delivery receipt has been
-	// received from this recipient.
-	DeliveredTime string
-	// RemoteMessageID is the message ID assigned to the message by the
-	// recipient.  It is empty if no delivery receipt has been received from
-	// this recipient.
-	RemoteMessageID string
-	// receivedBBS is the BBS where we retrieved the delivery receipt, which
-	// presumably is also the BBS through which we sent the message.  We
-	// need this to resolve addresses without a domain.
-	receivedBBS string
+// readStateFile reads the incident state from the specified file.
+func readStateFile(fname string) (inc *Incident, err error) {
+	var fh *os.File
+
+	if fh, err = os.Open(fname); err != nil {
+		slog.Error("os.Open", "f", fname, "err", err)
+		return nil, err
+	}
+	defer fh.Close()
+	inc = new(Incident)
+	if err = json.UnmarshalRead(fh, inc, json.RejectUnknownMembers(true)); err != nil {
+		slog.Error("json.UnmarshalRead", "f", fname, "err", err)
+		return nil, fmt.Errorf("parse %s: %s", fh.Name(), err)
+	}
+	if inc.Config == nil {
+		inc.Config = new(Config)
+	}
+	return inc, nil
 }
 
-// Deliveries returns the delivery information for an outgoing message.  One
-// DeliveryInfo structure is returned for each distinct To/Cc/Bcc address in the
-// message.  (If there are none, a single structure is returned.)  An error is
-// returned only if files cannot be read or decoded.
-func Deliveries(lmi string) (delivs []*DeliveryInfo, err error) {
+// writeStateFile writes out the new state file for an incident.
+func (inc *Incident) writeStateFile() (err error) {
 	var (
-		env   *envelope.Envelope
-		addrs []*envelope.Address
-		seq   = 2
+		fname string
+		fh    *os.File
 	)
-	if env, _, err = readEnvelope(lmi, ""); err != nil {
-		return nil, err
+	fname = filepath.Join(inc.Dir, jsonFileName)
+	if fh, err = os.Create(fname); err != nil {
+		slog.Error("os.Create", "f", fname, "err", err)
+		return err
 	}
-	if env.IsReceived() {
-		return nil, fmt.Errorf("%s: not an outgoing message", lmi)
+	if err = json.MarshalWrite(fh, inc); err != nil {
+		slog.Error("json.MarshalWrite", "f", fname, "err", err)
+		fh.Close()
+		os.Remove(fname) // better gone than corrupt?
+		return fmt.Errorf("write %s: %s", fname, err)
 	}
-	if addrs, err = envelope.ParseAddressList(env.To); err != nil {
-		return nil, fmt.Errorf("%s: invalid To field: %s", lmi, err)
+	if err = fh.Close(); err != nil {
+		slog.Error("os.Close", "f", fname, "err", err)
+		os.Remove(fname)
+		return fmt.Errorf("close %s: %s", fname, err)
 	}
-	if len(addrs) == 0 {
-		return []*DeliveryInfo{{}}, nil
-	}
-	delivs = make([]*DeliveryInfo, len(addrs))
-	for i, addr := range addrs {
-		delivs[i] = &DeliveryInfo{Recipient: addr.Address}
-	}
-	if deliv, err := readDelivery(lmi + ".DR.txt"); err != nil && !os.IsNotExist(err) {
-		return nil, err
-	} else if deliv != nil {
-		delivs = assignDelivery(delivs, deliv)
-	}
-	for {
-		if deliv, err := readDelivery(fmt.Sprintf("%s.DR%d.txt", lmi, seq)); err != nil && !os.IsNotExist(err) {
-			return nil, err
-		} else if deliv != nil {
-			delivs = assignDelivery(delivs, deliv)
-		} else {
-			break
-		}
-		seq++
-	}
-	return delivs, nil
-}
-
-// readDelivery reads a delivery receipt and creates a DeliveryInfo.
-func readDelivery(fname string) (deliv *DeliveryInfo, err error) {
-	var (
-		contents []byte
-		env      *envelope.Envelope
-		body     string
-		msg      message.Message
-		dr       *delivrcpt.DeliveryReceipt
-	)
-	if contents, err = os.ReadFile(fname); err != nil {
-		return nil, err
-	}
-	if env, body, err = envelope.ParseSaved(string(contents)); err != nil {
-		return nil, fmt.Errorf("%s: stored message could not be parsed: %s", fname, err)
-	}
-	if addrs, err := envelope.ParseAddressList(env.From); err == nil {
-		env.From = addrs[0].Address
-	}
-	msg = message.Decode(env, body)
-	if dr, _ = msg.(*delivrcpt.DeliveryReceipt); dr == nil || !env.IsReceived() {
-		return nil, fmt.Errorf("%s: not a received delivery receipt", fname)
-	}
-	return &DeliveryInfo{env.From, dr.DeliveredTime, dr.LocalMessageID, env.ReceivedBBS}, nil
-}
-
-// assignDelivery assigns a DeliveryInfo to the correct recipient in the
-// list of deliveries.  If no matching recipient is found, one is added.
-func assignDelivery(delivs []*DeliveryInfo, deliv *DeliveryInfo) []*DeliveryInfo {
-	for _, d := range delivs {
-		if recipientMatch(d.Recipient, deliv) {
-			d.DeliveredTime, d.RemoteMessageID = deliv.DeliveredTime, deliv.RemoteMessageID
-			return delivs
-		}
-	}
-	return append(delivs, deliv)
-}
-
-// recipientMatch returns whether the Recipient in candidate is a match for the
-// target recipient.
-func recipientMatch(tgt string, candidate *DeliveryInfo) bool {
-	tlocal, tdomain, _ := strings.Cut(tgt, "@")
-	clocal, cdomain, _ := strings.Cut(candidate.Recipient, "@")
-	if !strings.EqualFold(tlocal, clocal) {
-		return false
-	}
-	if tdomain == "" {
-		tdomain = strings.ToLower(candidate.receivedBBS)
-	}
-	tfirst, trest, _ := strings.Cut(tdomain, ".")
-	cfirst, crest, _ := strings.Cut(cdomain, ".")
-	if !strings.EqualFold(tfirst, cfirst) {
-		return false
-	}
-	tscco := trest == "" || !strings.EqualFold(trest, "ampr.org") || !strings.EqualFold(trest, "scc-ares-races.org")
-	cscco := crest == "" || !strings.EqualFold(crest, "ampr.org") || !strings.EqualFold(crest, "scc-ares-races.org")
-	if tscco != cscco {
-		return false
-	} else if tscco && cscco {
-		return true
-	}
-	return strings.EqualFold(trest, crest)
+	return nil
 }

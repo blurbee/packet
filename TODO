@@ -1,3 +1,9 @@
-PDF generation in background.
-Problems with initial sync with TNC
-Excess text in PDF field gets cut off, with no obvious indication.
+Allow sorting of log grid columns
+Suggestion: address book
+
+Update packet-ex
+Incident archive
+Field comparisons
+CLI edit field honor bracketed escape mode
+Need more reliable way to locate Outpost data directory
+Need an import command to add a message in a text file to an incident (e.g. for WPP).

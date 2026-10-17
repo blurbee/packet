@@ -12,6 +12,7 @@ package jnos
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -31,13 +32,6 @@ type Transport interface {
 	// specified string was found, and any other error if something else
 	// goes wrong.
 	ReadUntil(string) (string, error)
-	// ReadUntilT reads data from the BBS until the specified string is
-	// seen, or the specified timeout occurs.  It returns the data that was
-	// read (even if it returns an error).  It returns ErrDisconnected if
-	// the connection to the BBS was lost, ErrTimeout if the read timed out
-	// before the specified string was found, and any other error if
-	// something else goes wrong.
-	ReadUntilT(string, time.Duration) (string, error)
 	// Send sends a string to the BBS.  It returns ErrDisconnected if the
 	// connection to the BBS was lost, and any other error if something else
 	// goes wrong.
@@ -68,13 +62,20 @@ type Conn struct {
 // jnosPromptRE is a regular expression matching the JNOS prompt.
 var jnosPromptRE = regexp.MustCompile(`^(?:Area: [A-Za-z0-9]+ )?\(#\d+\) >$`)
 
-// Connect connects to the JNOS BBS over the supplied open Transport.
-func Connect(t Transport) (c *Conn, err error) {
-	c = &Conn{t: t}
+// Connect connects to the JNOS BBS over the supplied open Transport.  If an
+// ident is supplied, it is sent as a JSON comment when connected, periodically
+// during the connection, and before closing the connection.
+func Connect(t Transport, ident string) (c *Conn, err error) {
+	c = &Conn{t: t, ident: ident}
 
 	// Read and discard the connection message.
 	if err = c.skipLinesUntilPrompt(); err != nil {
 		return nil, err
+	}
+	// Send the ident if any.
+	if ident != "" {
+		c.identEvery = 8 * time.Minute
+		c.maybeIdent()
 	}
 	// Turn off paging.
 	if err = c.t.Send("XM 0\n"); err != nil {
@@ -84,16 +85,6 @@ func Connect(t Transport) (c *Conn, err error) {
 		return nil, err
 	}
 	return c, nil
-}
-
-// IdentEvery causes the JNOS handler to send a comment with an identification
-// every so often.  This can be used to send an FCC call sign if we're connected
-// over the air with a tactical call and we're connected for longer than 10
-// minutes.
-func (c *Conn) IdentEvery(interval time.Duration, ident string) {
-	c.ident = ident
-	c.identEvery = interval
-	c.nextIdent = time.Now().Add(interval)
 }
 
 // Send sends a private message.  Note that the "to" addresses must be bare
@@ -198,6 +189,7 @@ func (c *Conn) SetArea(area string) error {
 			return nil
 		}
 		if strings.Contains(line, "No such message area") {
+			slog.Error("no such message area", "area", area)
 			return errors.New("no such message area: " + area)
 		}
 	}
@@ -244,7 +236,8 @@ var listHeader = "St.  #  TO            FROM     DATE   SIZE SUBJECT"
 var listMsgLineRE = regexp.MustCompile(`^[> ]([D ])([HYN]) (  \d| \d\d|\d+) ([^ ].{12}) ([^ ].{7}) ((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?: \d|\d\d)) (   \d|  \d\d| \d\d\d|\d+) (.*)`)
 
 // List returns the list of messages.  If "to" is set, only messages sent to
-// addresses containing that string are returned.
+// addresses containing that string are returned.  List returns nil if there are
+// no messages.
 func (c *Conn) List(to string) (ml *MessageList, err error) {
 	var (
 		cmd   string
@@ -268,6 +261,7 @@ func (c *Conn) List(to string) (ml *MessageList, err error) {
 		c.skipLinesUntilPrompt()
 		return nil, nil
 	} else if !strings.HasPrefix(line, listLine1Prefix) {
+		slog.Error("unexpected response", "exp", "Mail area: %s", "act", line)
 		return nil, fmt.Errorf(`expected "Mail area: %%s" received %q`, line)
 	}
 	ml.Area = line[len(listLine1Prefix):]
@@ -275,6 +269,7 @@ func (c *Conn) List(to string) (ml *MessageList, err error) {
 	if line, err = c.readLine(); err != nil {
 		return nil, err
 	} else if match = listLine2RE.FindStringSubmatch(line); match == nil {
+		slog.Error("unexpected response", "exp", "%d message(s)  -  %d new", "act", line)
 		return nil, fmt.Errorf(`expected "%%d message(s)  -  %%d new" received %q`, line)
 	}
 	ml.Count, _ = strconv.Atoi(match[1])
@@ -283,6 +278,7 @@ func (c *Conn) List(to string) (ml *MessageList, err error) {
 	if line, err = c.readLine(); err != nil {
 		return nil, err
 	} else if line != "" {
+		slog.Error("unexpected response", "exp", "", "act", line)
 		return nil, fmt.Errorf(`expected "" received %q`, line)
 	}
 	// Line 4: possibly "None to list.", otherwise list header.
@@ -292,6 +288,7 @@ func (c *Conn) List(to string) (ml *MessageList, err error) {
 		c.skipLinesUntilPrompt()
 		return nil, nil
 	} else if line != listHeader {
+		slog.Error("unexpected respuonse", "exp", listHeader, "act", line)
 		return nil, fmt.Errorf(`expected %q received %q`, listHeader, line)
 	}
 	// Subsequent lines: messages.
@@ -330,6 +327,7 @@ func (c *Conn) List(to string) (ml *MessageList, err error) {
 	}
 	// We should now be looking at the JNOS prompt.
 	if !jnosPromptRE.MatchString(line) {
+		slog.Error("unexpected response", "exp", "JNOS prompt", "act", line)
 		return nil, fmt.Errorf(`expected JNOS prompt, received %q`, line)
 	}
 	return ml, nil
@@ -362,6 +360,7 @@ func (c *Conn) Read(msgnum int) (msg string, err error) {
 		return "", c.skipLinesUntilPrompt()
 	} else if !msgLine1RE.MatchString(line) {
 		c.skipLinesUntilPrompt()
+		slog.Error("unexpected response", "exp", "Message %d", "act", line)
 		return "", fmt.Errorf(`expected "Message %%d" received %q`, line)
 	}
 	for {
@@ -374,6 +373,7 @@ func (c *Conn) Read(msgnum int) (msg string, err error) {
 				msg = removeNewMailRE.ReplaceAllLiteralString(msg, "\n")
 				return msg, nil
 			}
+			slog.Error("unexpected response", "exp", "message body", "act", "JNOS prompt")
 			return "", fmt.Errorf(`expected message body, received JNOS prompt`)
 		}
 		sb.WriteString(line)
@@ -413,6 +413,7 @@ func (c *Conn) Kill(msgnums ...int) (err error) {
 		}
 		if !killMsgRE.MatchString(line) {
 			c.skipLinesUntilPrompt()
+			slog.Error("unexpected response", "exp", "Msg %d Killed.", "act", line)
 			return fmt.Errorf(`expected "Msg %%d Killed." received %q`, line)
 		}
 	}
@@ -421,11 +422,11 @@ func (c *Conn) Kill(msgnums ...int) (err error) {
 // maybeIdent checks for whether we should send an ident string, and if so, does
 // so.  Errors are ignored.
 func (c *Conn) maybeIdent() {
-	if c.nextIdent.IsZero() || time.Now().Before(c.nextIdent) {
+	if c.ident == "" || time.Now().Before(c.nextIdent) {
 		return
 	}
 	c.nextIdent = time.Now().Add(c.identEvery)
-	if err := c.t.Send(fmt.Sprintf("# %s\n", c.ident)); err != nil {
+	if err := c.t.Send(fmt.Sprintf("# DE %s\n", c.ident)); err != nil {
 		return
 	}
 	c.skipLinesUntilPrompt()
@@ -436,6 +437,11 @@ func (c *Conn) maybeIdent() {
 func (c *Conn) Close() (err error) {
 	var line string
 
+	// Send an ident if needed.
+	if c.ident != "" {
+		c.nextIdent = time.Time{}
+		c.maybeIdent()
+	}
 	// Send the BYE command to the BBS.
 	if err = c.t.Send("B\r"); err != nil {
 		c.t.Close()
@@ -444,10 +450,12 @@ func (c *Conn) Close() (err error) {
 	// Read until the underlying connection has been disconnected.
 	if line, err = c.readLine(); err == nil {
 		c.t.Close()
+		slog.Error("unexpected response", "exp", "disconnect", "act", line)
 		return fmt.Errorf(`expected disconnect, received %q`, line)
 	}
 	if err != ErrDisconnected {
 		c.t.Close()
+		slog.Error("unexpected response", "exp", "disconnect", "err", err)
 		return fmt.Errorf(`expected disconnect, got error: %s`, err)
 	}
 	return c.t.Close()

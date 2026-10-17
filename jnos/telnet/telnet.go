@@ -11,12 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"regexp"
 	"strconv"
 	"time"
 
-	"github.com/rothskeller/packet/jnos"
+	"github.com/rothskeller/packet/v4/jnos"
 )
 
 // trace is a flag indicating that data sent and retrieved should be echoed to
@@ -45,7 +46,7 @@ func Connect(bbsAddress, mailbox, password string, log io.Writer) (c *jnos.Conn,
 	if t, err = Open(bbsAddress, mailbox, password, log); err != nil {
 		return nil, err
 	}
-	if c, err = jnos.Connect(t); err != nil {
+	if c, err = jnos.Connect(t, ""); err != nil {
 		t.Close()
 		return nil, fmt.Errorf("BBS connect: %s", err)
 	}
@@ -90,6 +91,7 @@ func Open(bbsAddress, mailbox, password string, log io.Writer) (t *Transport, er
 		sum = md5.Sum(buf)
 		password = hex.EncodeToString(sum[:])
 	} else {
+		slog.Error("JNOS password prompt did not include MD5 challenge")
 		err = errors.New("JNOS password prompt did not include MD5 challenge")
 		goto ERROR
 	}
@@ -116,25 +118,18 @@ type Transport struct {
 // timeout occurs.  It returns the data that was read (even if it returns an
 // error.)
 func (t *Transport) ReadUntil(until string) (data string, err error) {
-	return t.ReadUntilT(until, bbsTimeout)
-}
-
-// ReadUntilT reads data from the BBS until the specified string is seen, or the
-// specifiedtimeout occurs.  It returns the data that was read (even if it
-// returns an error.)
-func (t *Transport) ReadUntilT(until string, timeout time.Duration) (data string, err error) {
 	var (
 		untilb []byte
 		timer  *time.Timer
 	)
 	untilb = bytes.ReplaceAll([]byte(until), lf, crlf)
-	timer = time.NewTimer(timeout)
+	timer = time.NewTimer(bbsTimeout)
 	timer.Stop()
 	for err == nil {
 		if data = t.checkPending(untilb); data != "" {
 			return data, nil
 		}
-		timer.Reset(timeout)
+		timer.Reset(bbsTimeout)
 		select {
 		case read, ok := <-t.readch:
 			if !ok {
@@ -148,6 +143,7 @@ func (t *Transport) ReadUntilT(until string, timeout time.Duration) (data string
 				<-timer.C
 			}
 		case <-timer.C:
+			slog.Error("timeout")
 			err = jnos.ErrTimeout
 		}
 	}
@@ -194,6 +190,7 @@ func (t *Transport) Send(data string) (err error) {
 	}
 	for len(tosend) != 0 {
 		if count, err = t.telnet.Write(tosend); err != nil {
+			slog.Error("telnet.Write", "err", err)
 			return err
 		}
 		tosend = tosend[count:]
@@ -203,7 +200,11 @@ func (t *Transport) Send(data string) (err error) {
 
 // Close closes the connection to the BBS.
 func (t *Transport) Close() error {
-	return t.telnet.Close()
+	if err := t.telnet.Close(); err != nil {
+		slog.Error("telnet.Close", "err", err)
+		return err
+	}
+	return nil
 }
 
 // UseVerboseReads returns whether it's appropriate to use verbose reads
@@ -214,6 +215,7 @@ func (t *Transport) UseVerboseReads() bool { return true }
 // a background reader thread for it.
 func (t *Transport) connectTelnet(address string) (err error) {
 	if t.telnet, err = net.Dial("tcp", address); err != nil {
+		slog.Error("net.Dial", "addr", address, "err", err)
 		return err
 	}
 	var readch = make(chan []byte, 16)
@@ -243,6 +245,9 @@ func (t *Transport) reader(readch chan<- []byte, errch chan<- error) {
 				t.log.Write(out)
 			}
 			readch <- out
+		}
+		if err != nil && err != io.EOF {
+			slog.Error("telnet.Read", "err", err)
 		}
 		if err != nil {
 			close(readch)

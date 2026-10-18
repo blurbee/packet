@@ -25,6 +25,8 @@ type bbsConnection struct {
 	finished         bool   // the exchange has finished
 	closeAfterUpdate bool   // finished; remove from bbsConnections once the error is sent
 	cancel           func()
+	stop             chan struct{} // closed to ask the exchange to stop politely
+	stopping         bool          // stop has been closed
 	notify           chan struct{} // closed when Seq changes or exchange finishes
 	done             chan struct{} // closed when the exchange finishes (may be nil in tests)
 }
@@ -52,7 +54,7 @@ func (s *Server) servePostConnectBBS(w http.ResponseWriter, r *http.Request) {
 	// which supersedes it, so its error is dropped.  (It was also written
 	// to the Link Monitor, and the log file, when it happened.)
 	ctx, cancel := context.WithCancel(context.Background())
-	conn := &bbsConnection{dir: dir, cancel: cancel, done: make(chan struct{})}
+	conn := &bbsConnection{dir: dir, cancel: cancel, stop: make(chan struct{}), done: make(chan struct{})}
 	addMonitorLine(dir, monitorSeparator())
 	bbsConnections[dir] = conn
 	bbsConnectionsMutex.Unlock()
@@ -61,17 +63,35 @@ func (s *Server) servePostConnectBBS(w http.ResponseWriter, r *http.Request) {
 }
 
 // servePostConnectAbort handles POST /connect-abort requests, which has a dir=
-// parameter identifying the incident whose connection should be aborted.  It
-// always returns 204.
+// parameter identifying the incident whose connection should be aborted.  The
+// first request asks the exchange to stop politely: to finish what it's doing
+// (e.g., the message being sent), and sign off from the BBS.  A second request
+// aborts the connection at once, for when the link is stuck.  It always
+// returns 204.
 func (s *Server) servePostConnectAbort(w http.ResponseWriter, r *http.Request) {
-	var dir = r.FormValue("dir")
+	var (
+		dir    = r.FormValue("dir")
+		polite *bbsConnection
+	)
 	bbsConnectionsMutex.Lock()
-	if bbsConnections[dir] != nil {
-		bbsConnections[dir].cancel()
+	if c := bbsConnections[dir]; c != nil && !c.finished {
+		if c.stop != nil && !c.stopping {
+			c.stopping = true
+			close(c.stop)
+			polite = c
+		} else {
+			c.cancel()
+		}
 	}
 	bbsConnectionsMutex.Unlock()
+	if polite != nil {
+		polite.Progress("Stopping after the current step, then signing off.  Choose Abort Connection again to stop at once.")
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// StopRequested implements incident.BBSExchangeStopper.
+func (c *bbsConnection) StopRequested() <-chan struct{} { return c.stop }
 
 // serveGetConnectProgress handles GET /connect-progress requests, which have a
 // dir= parameter identifying the incident owning the connection and a seq=

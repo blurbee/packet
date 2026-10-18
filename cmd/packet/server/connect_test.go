@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -299,5 +300,46 @@ func TestAbortBBSConnections(t *testing.T) {
 	}
 	if elapsed < 400*time.Millisecond || elapsed > 2*time.Second {
 		t.Errorf("waited %v for a stuck connection, want about the 500ms limit", elapsed)
+	}
+}
+
+// TestConnectAbortTwoStage checks that the first Abort asks the exchange to
+// stop politely, and only a second one aborts it.
+func TestConnectAbortTwoStage(t *testing.T) {
+	dir := t.TempDir()
+	var canceled atomic.Bool
+	c := &bbsConnection{dir: dir, cancel: func() { canceled.Store(true) }, stop: make(chan struct{})}
+	bbsConnectionsMutex.Lock()
+	bbsConnections[dir] = c
+	bbsConnectionsMutex.Unlock()
+	t.Cleanup(func() {
+		bbsConnectionsMutex.Lock()
+		delete(bbsConnections, dir)
+		bbsConnectionsMutex.Unlock()
+	})
+	s := newTestServer()
+	abort := func() {
+		r := httptest.NewRequest("POST", "/connect-abort?dir="+url.QueryEscape(dir), nil)
+		w := httptest.NewRecorder()
+		s.servePostConnectAbort(w, r)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status %d", w.Code)
+		}
+	}
+	abort()
+	select {
+	case <-c.StopRequested():
+	default:
+		t.Fatal("first Abort didn't ask the exchange to stop")
+	}
+	if canceled.Load() {
+		t.Fatal("first Abort aborted the connection")
+	}
+	if !strings.HasPrefix(c.ProgMsg, "Stopping after the current step") {
+		t.Errorf("progress %q", c.ProgMsg)
+	}
+	abort()
+	if !canceled.Load() {
+		t.Fatal("second Abort didn't abort the connection")
 	}
 }

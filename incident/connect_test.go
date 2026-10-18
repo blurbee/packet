@@ -176,7 +176,11 @@ type recorder struct {
 	finished         chan struct{}
 	onProgress       func(string)
 	reportedAfterFin bool
+	stop             chan struct{} // returned by StopRequested
 }
+
+// StopRequested implements BBSExchangeStopper.  (A nil channel never asks.)
+func (r *recorder) StopRequested() <-chan struct{} { return r.stop }
 
 func newRecorder(ft *fakeTransport) *recorder {
 	return &recorder{ft: ft, finished: make(chan struct{})}
@@ -541,5 +545,61 @@ func TestBBSExchangeReadsAllMessages(t *testing.T) {
 	}
 	if len(rec.errors) != 0 {
 		t.Errorf("unexpected errors %q", rec.errors)
+	}
+}
+
+// TestBBSExchangeStopIsPolite checks that a stop requested while a message is
+// being sent lets that message finish, sends no more, and signs off from the
+// BBS rather than aborting.
+func TestBBSExchangeStopIsPolite(t *testing.T) {
+	dir := newTestIncident(t)
+	if err := Write(dir, func(i *Incident) error {
+		for _, subj := range []string{"first message", "second message"} {
+			dm := message.PlainMessage.NewDraft().(*message.DraftMessage)
+			dm.SetTo("W1XSC")
+			dm.Subject().SetSubjectSummary(subj)
+			dm.Subject().SetSubjectHandling("IMMEDIATE") // runExchange uses immOnly
+			le, err := i.AddDraftMessage(dm)
+			if err != nil {
+				return err
+			}
+			le.Status = StatusQueued
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec := newRecorder(nil)
+	rec.stop = make(chan struct{})
+	var sends int
+	ft := newFakeTransport(func(s string) (string, bool) {
+		switch {
+		case strings.HasPrefix(s, "SP "):
+			sends++
+			return "Subject:\n", false
+		case strings.HasSuffix(s, "/EX\n"):
+			// The user stops the exchange while the message is
+			// on its way.
+			close(rec.stop)
+			return "Msg queued\n(#1) >\n", false
+		case strings.Contains(s, " message\n"): // the subject line
+			return "Enter message.  End with /EX or ^Z in first column (^A aborts):\n", false
+		}
+		return bbs(s)
+	})
+	rec.ft = ft
+	useFakeTransport(t, ft)
+	runExchange(t, context.Background(), dir, rec, nil)
+	if len(rec.errors) != 0 {
+		t.Errorf("unexpected errors %q", rec.errors)
+	}
+	if sends != 1 || rec.logentries != 1 {
+		t.Errorf("sent %d messages (%d log entries), want 1", sends, rec.logentries)
+	}
+	if sent := ft.sentCommands(); !slices.Contains(sent, "B\r") {
+		t.Errorf("no orderly disconnect; sent %q", sent)
+	}
+	if !slices.Contains(rec.progress, "Stopped at your request.") {
+		t.Errorf("progress %q doesn't report the stop", rec.progress)
 	}
 }

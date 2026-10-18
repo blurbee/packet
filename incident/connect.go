@@ -43,6 +43,10 @@ var errAborted = errors.New("connection aborted by user")
 func BBSExchange(ctx context.Context, dir string, immOnly bool, updates BBSExchangeWatcher) {
 	var e = &exchange{dir: dir, immOnly: immOnly, updates: updates}
 
+	if s, ok := updates.(BBSExchangeStopper); ok {
+		e.stop = s.StopRequested()
+	}
+
 	// All cleanup, including the call to Finished, is done by this single
 	// deferred call, on every path (including a panic).
 	defer e.cleanup(ctx)
@@ -250,6 +254,16 @@ type BBSExchangeWatcher interface {
 	Finished()
 }
 
+// BBSExchangeStopper is an optional extension of BBSExchangeWatcher.  If the
+// watcher passed to BBSExchange implements it, closing the channel returned
+// by StopRequested asks the exchange to stop politely:  it finishes the step
+// in progress (e.g., the message being sent), starts no new one, and signs
+// off from the BBS in the usual way.  (Canceling the context passed to
+// BBSExchange, by contrast, aborts the connection at once.)
+type BBSExchangeStopper interface {
+	StopRequested() <-chan struct{}
+}
+
 // BBSExchangeMonitor is an optional extension of BBSExchangeWatcher.  If the
 // watcher passed to BBSExchange implements it, Monitor is called with each line
 // of a live display of the exchange: for KISS connections, a packet monitor
@@ -311,9 +325,10 @@ type exchange struct {
 	// Resources held during the exchange, released by cleanup.
 	logf      *os.File
 	monitorlw *lineWriter
-	reserved  []string    // entries in connectionsRunning
-	stopAbort func() bool // unregisters the abort-on-cancel hook
-	failed    bool        // an error has been reported to updates
+	reserved  []string        // entries in connectionsRunning
+	stopAbort func() bool     // unregisters the abort-on-cancel hook
+	stop      <-chan struct{} // closed to ask for a polite stop (see BBSExchangeStopper), or nil
+	failed    bool            // an error has been reported to updates
 }
 
 // bbsExchangeStep takes one step in the BBS exchange process.  If there's a
@@ -331,6 +346,16 @@ func (e *exchange) step(ctx context.Context) (done bool, err error) {
 	case <-ctx.Done():
 		slog.Info("connection aborted by user")
 		return false, errAborted
+	default: // continue
+	}
+	// Has the user asked us to stop?  If so, we're done, once any message
+	// we just read has been killed; cleanup signs off from the BBS.
+	select {
+	case <-e.stop:
+		if e.tokill == 0 {
+			e.progress("Stopped at your request.")
+			return true, nil
+		}
 	default: // continue
 	}
 	// Is there a message waiting to be sent?

@@ -89,7 +89,14 @@ func (m *ReceivedMessage) RFC5322() string {
 func readReceivedMessage(filename string, hdr mail.Header, cm *common) (_ Message, err error) {
 	m := ReceivedMessage{common: cm}
 	m.OnDirty(func(reason string) {
-		if reason != "envelope.common.subject" && reason != "form.FormBody.Field.RECEIVED" {
+		switch reason {
+		case "envelope.common.subject", "form.FormBody.Field.RECEIVED",
+			// Importing a received message from a file that doesn't
+			// carry our local message ID assigns one, and records it
+			// as the form's destination message number.
+			"form.FormBody.Common.destinationMessageID", "form.FormBody.Field.DestMsgNo":
+			// OK
+		default:
 			panic("ReceivedMessage should not change: " + reason)
 		}
 	})

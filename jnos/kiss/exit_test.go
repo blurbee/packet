@@ -145,7 +145,7 @@ func TestResetBeforeStart(t *testing.T) {
 	var lines []string
 	monitor := func(line string) { lines = append(lines, line) }
 	radio := newFakeRadio("1")
-	if err := resetBeforeStart(radio, monitor); err != nil {
+	if err := resetBeforeStart(radio, kenwoodReset, monitor); err != nil {
 		t.Fatal(err)
 	}
 	if !radio.kiss || !strings.Contains(strings.Join(lines, "\n"), "re-entered it with TN 2,1") {
@@ -153,7 +153,7 @@ func TestResetBeforeStart(t *testing.T) {
 	}
 	silent := newFakeRadio("0")
 	silent.silent = true
-	if err := resetBeforeStart(silent, monitor); err == nil || !strings.Contains(err.Error(), "back to KISS mode") {
+	if err := resetBeforeStart(silent, kenwoodReset, monitor); err == nil || !strings.Contains(err.Error(), "back to KISS") {
 		t.Errorf("failed reset before start: got %v", err)
 	}
 }

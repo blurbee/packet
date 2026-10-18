@@ -349,7 +349,14 @@
             KISS connection. This is like a Serial+TNC connection, but for
             TNCs that support only KISS mode, such as the one built into the
             Kenwood TH-D75. The SCCo Packet Messenger manages the AX.25
-            connection to the BBS itself.
+            connection to the BBS itself. The KISS TNC types it knows are
+            defined by device definitions; to add one (or change a built-in
+            one), put a definition file, named <i>something</i>.json, in the
+            "KISS" folder of the packet software's data folder
+            (~/.local/share/packet/KISS on Mac OS and Linux,
+            C:\PackItForms\KISS on Windows). The <code>emit-kiss-json</code>
+            tool in the source code writes the definition of an existing TNC
+            type in that format, as a starting point.
           </li>
           <li>
             Telnet connection. The SCCo Packet Messenger will connect to the BBS

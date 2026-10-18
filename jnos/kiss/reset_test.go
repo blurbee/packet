@@ -107,21 +107,21 @@ func (r *fakeRadio) commands() []string {
 
 // fastReset shortens the reset timings for a test.
 func fastReset(t *testing.T) {
-	oldSettle, oldExit, oldReply := resetSettle, resetExitWait, resetReplyWait
-	resetSettle, resetExitWait, resetReplyWait = 50*time.Millisecond, 20*time.Millisecond, 300*time.Millisecond
-	t.Cleanup(func() { resetSettle, resetExitWait, resetReplyWait = oldSettle, oldExit, oldReply })
+	oldExit, oldReply := kenwoodExitWait, kenwoodReplyWait
+	kenwoodExitWait, kenwoodReplyWait = 20*time.Millisecond, 300*time.Millisecond
+	t.Cleanup(func() { kenwoodExitWait, kenwoodReplyWait = oldExit, oldReply })
 }
 
 func TestKenwoodReset(t *testing.T) {
 	fastReset(t)
 	radio := newFakeRadio("1")
-	cmd, err := kenwoodReset(radio)
+	did, err := kenwoodReset(radio)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The second TN setting the radio reported is kept.
-	if cmd != "TN 2,1" {
-		t.Errorf("re-entered KISS with %q, want %q", cmd, "TN 2,1")
+	if !strings.HasSuffix(did, "re-entered it with TN 2,1") {
+		t.Errorf("reset did %q, want re-entering KISS with %q", did, "TN 2,1")
 	}
 	if want := []string{"KISS exit", "", "TN", "TN 2,1"}; strings.Join(radio.commands(), "|") != strings.Join(want, "|") {
 		t.Errorf("sent %q, want %q", radio.commands(), want)
@@ -155,6 +155,7 @@ func TestKenwoodResetNoAnswer(t *testing.T) {
 func withRadio(radio *fakeRadio, reopened *int) func(*Transport) {
 	var mu sync.Mutex
 	return func(t *Transport) {
+		t.reset = kenwoodReset
 		t.reopen = func() (resetPort, error) {
 			mu.Lock()
 			*reopened++
@@ -255,12 +256,12 @@ func TestKenwoodResetOutOfKISS(t *testing.T) {
 	fastReset(t)
 	radio := newFakeRadio("0")
 	radio.kiss = false
-	cmd, err := kenwoodReset(radio)
+	did, err := kenwoodReset(radio)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cmd != "TN 2,0" || !radio.kiss {
-		t.Errorf("re-entered KISS with %q (in KISS: %v)", cmd, radio.kiss)
+	if !strings.HasSuffix(did, "TN 2,0") || !radio.kiss {
+		t.Errorf("reset did %q (in KISS: %v)", did, radio.kiss)
 	}
 }
 

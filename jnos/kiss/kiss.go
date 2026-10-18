@@ -1,9 +1,14 @@
 // Package kiss provides a transport layer for communicating with a JNOS BBS
-// over RF, by way of a serial connection to a TNC in KISS mode (such as the
-// one built into the Kenwood TH-D75).  A KISS TNC only sends and receives raw
-// AX.25 frames, so this package implements the AX.25 version 2.0 connected
-// mode link itself.  The Connect function, if successful, returns a jnos.Conn
-// for interaction with the BBS.
+// over RF, by way of a serial connection to a TNC in KISS mode.  A KISS TNC
+// only sends and receives raw AX.25 frames, so this package implements the
+// AX.25 version 2.0 connected mode link itself.  The Connect function, if
+// successful, returns a jnos.Conn for interaction with the BBS.
+//
+// The link itself is the same for every TNC.  Everything particular to a TNC
+// (its link settings, and how it must be handled: its serial port lines,
+// full duplex, how to reset it) is in its device definition (see Device and
+// builtin.go), and the code particular to a kind of TNC is in its own file
+// (e.g., kenwood.go), selected by its definition.
 package kiss
 
 import (
@@ -102,7 +107,7 @@ func Connect(dev *Device, serialPort, bbsAddress, mailbox, callsign string, log 
 
 // ConnectContext is Connect, except that canceling ctx before it returns
 // abandons the connection attempt promptly (with the same cleanup as Close
-// after an Abort, including a reset of a Kenwood TNC).  Once it returns, ctx
+// after an Abort, including a reset of the TNC if it has a reset method).  Once it returns, ctx
 // no longer affects the connection.
 func ConnectContext(ctx context.Context, dev *Device, serialPort, bbsAddress, mailbox, callsign string, log io.Writer, monitor func(line string)) (c *jnos.Conn, err error) {
 	var (
@@ -123,24 +128,16 @@ func ConnectContext(ctx context.Context, dev *Device, serialPort, bbsAddress, ma
 		slog.Error("serial.Open", "port", serialPort, "err", err)
 		return nil, fmt.Errorf("serial.Open: %s", err)
 	}
-	// Raise DTR and RTS: the TH-D75 (like many USB TNCs) ignores data from
-	// the computer while DTR is low, and macOS leaves it low by default.
-	// Some ports (e.g., Bluetooth ones) don't have these lines; that's fine.
-	if err := port.SetDTR(true); err != nil {
-		slog.Debug("serial.SetDTR", "port", serialPort, "err", err)
-	}
-	if err := port.SetRTS(true); err != nil {
-		slog.Debug("serial.SetRTS", "port", serialPort, "err", err)
-	}
+	setModemLines(port, dev, serialPort)
 	var opts []func(*Transport)
-	if dev.KenwoodReset {
+	if reset := resetMethods[dev.Reset]; reset != nil {
 		// If the last session on this port never finished (the
 		// program was killed in the middle of it, say), the TNC may
 		// still hold frames from it; reset it before starting.
 		marker := sessionMarker(serialPort)
 		if marker != "" {
 			if _, err := os.Stat(marker); err == nil {
-				if err = resetBeforeStart(port, monitor); err != nil {
+				if err = resetBeforeStart(port, reset, monitor); err != nil {
 					port.Close()
 					return nil, err
 				}
@@ -149,11 +146,11 @@ func ConnectContext(ctx context.Context, dev *Device, serialPort, bbsAddress, ma
 		}
 		opts = append(opts, func(t *Transport) {
 			t.marker = marker
+			t.reset = reset
 			t.reopen = func() (resetPort, error) {
 				port, err := serial.Open(serialPort, &serial.Mode{})
 				if err == nil {
-					port.SetDTR(true)
-					port.SetRTS(true)
+					setModemLines(port, dev, serialPort)
 				}
 				return port, err
 			}
@@ -170,6 +167,22 @@ func ConnectContext(ctx context.Context, dev *Device, serialPort, bbsAddress, ma
 		return nil, fmt.Errorf("BBS connect: %s", err)
 	}
 	return c, nil
+}
+
+// setModemLines raises the DTR and RTS lines of the (just opened) port, as the
+// device calls for (see Device.AssertDTR).  Some ports (e.g., Bluetooth ones)
+// don't have these lines; that's fine.
+func setModemLines(port serial.Port, dev *Device, serialPort string) {
+	if dev.AssertDTR {
+		if err := port.SetDTR(true); err != nil {
+			slog.Debug("serial.SetDTR", "port", serialPort, "err", err)
+		}
+	}
+	if dev.AssertRTS {
+		if err := port.SetRTS(true); err != nil {
+			slog.Debug("serial.SetRTS", "port", serialPort, "err", err)
+		}
+	}
 }
 
 // withContext is an option for open: canceling ctx aborts the Transport, until
@@ -211,7 +224,8 @@ type Transport struct {
 	portOnce         sync.Once
 	portClosed       chan struct{}             // closed when port.Close returns
 	portErr          error                     // result of port.Close
-	reopen           func() (resetPort, error) // reopens the port to reset a Kenwood TNC, or nil
+	reopen           func() (resetPort, error) // reopens the port to reset the TNC, or nil
+	reset            resetMethod               // resets the TNC (see Device.Reset), or nil
 	cleanEnd         atomic.Bool               // the session ended with a clean disconnection
 	marker           string                    // file marking a session in progress (see sessionMarker), or ""
 	ctx              context.Context           // aborts the connection attempt when canceled (see withContext), or nil
@@ -422,7 +436,7 @@ func (t *Transport) Close() (err error) {
 		}
 		timer.Stop()
 		err = t.closePort()
-		if t.reopen == nil || t.cleanEnd.Load() || t.resetTNC() {
+		if t.reopen == nil || t.reset == nil || t.cleanEnd.Load() || t.resetTNC() {
 			// The TNC is in good order; the next session needn't
 			// reset it.
 			clearSession(t.marker)
@@ -434,14 +448,14 @@ func (t *Transport) Close() (err error) {
 	return err
 }
 
-// resetTNC resets a Kenwood TNC after a session that didn't end cleanly (see
-// kenwoodReset), so that it doesn't transmit frames it still holds after we've
-// given up, and starts the next session clean.  It is best-effort, and reports
-// the result to the monitor; it returns whether it succeeded.  The port must
-// already be closed.
+// resetTNC resets the TNC after a session that didn't end cleanly, using the
+// device's reset method (see Device.Reset), so that it doesn't transmit frames
+// it still holds after we've given up, and starts the next session clean.  It
+// is best-effort, and reports the result to the monitor; it returns whether it
+// succeeded.  The port must already be closed.
 func (t *Transport) resetTNC() bool {
 	if last := t.lastSent.Load(); last != 0 {
-		if wait := resetSettle - time.Since(time.Unix(0, last)); wait > 0 {
+		if wait := t.dev.ResetSettle - time.Since(time.Unix(0, last)); wait > 0 {
 			time.Sleep(wait) // let our last frame get on the air
 		}
 	}
@@ -452,14 +466,14 @@ func (t *Transport) resetTNC() bool {
 		return false
 	}
 	defer port.Close()
-	cmd, err := kenwoodReset(port)
+	did, err := t.reset(port)
 	if err != nil {
 		slog.Warn("TNC reset", "err", err)
-		t.note(fmt.Sprintf("TNC reset failed: %s.  Reset it on the radio: turn the TNC off and back to KISS.", err))
+		t.note(fmt.Sprintf("TNC reset failed: %s.", err))
 		return false
 	}
-	slog.Info("TNC reset", "reentered", cmd)
-	t.note("TNC reset: left KISS mode, discarding anything it still held, and re-entered it with " + cmd)
+	slog.Info("TNC reset", "did", did)
+	t.note("TNC reset: " + did)
 	return true
 }
 
@@ -1061,7 +1075,7 @@ const (
 // guess.  After that, it's based on the last rttWindow answer times: the larger
 // of twice their median (the BBS's typical answer time, which a single fast or
 // slow answer doesn't move) and one and a half times the slowest of them (so
-// that a BBS that sometimes takes much longer than usual, as W3XSC does when
+// that a BBS that sometimes takes much longer than usual, as a BBS does when
 // its channel is busy, doesn't get our retransmission while its answer is
 // still on the way: a duplicate, which it rejects, sending the link into
 // recovery for nothing).  A slow answer raises the interval at once; it comes
@@ -1312,9 +1326,9 @@ var polledWithoutGap = 3 * time.Second
 // us it never got that data: it polls only when its own timer has run out
 // waiting to hear from us.  So we resend the data now, right after our answer
 // to the poll and in the same turn at the channel, as QtTermTCP does, rather
-// than waiting for our own T1 to expire.  (W3XSC polls this way, resending its
-// last frame, whenever it misses our acknowledgment; waiting for T1 cost
-// 6-13 seconds each time.)
+// than waiting for our own T1 to expire.  (JNOS polls this way, resending its
+// last frame, whenever it misses our acknowledgment; waiting for T1 can cost
+// several seconds each time on a slow BBS.)
 func (t *Transport) resendIfPolledWithout() {
 	if t.lastFrame == nil || !t.lastFrame.command || !t.lastFrame.pf() {
 		return

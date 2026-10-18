@@ -97,7 +97,9 @@
         this._onFocus()
       }
       updateData(data) {
+        this.data = data
         this.ident = data.id
+        this.idx = data.idx
         this.seq = data.seq
         this.st = data.st
         this.f = data.f

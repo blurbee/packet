@@ -11,14 +11,27 @@
     //     The argument is an array of entry data objects.  Entries not already
     //     existing in the grid are added to the end of it.  Entries whose
     //     'st' is changed to 'X' are removed from the grid.
+    //
+    // Clicking a column header sorts the grid by that column, ascending; a
+    // second click sorts it descending, and a third returns it to the log's
+    // own order (by time).  The choice is remembered (in this browser).
     class LogGrid extends HTMLElement {
       constructor() {
         super()
         this._entries = []
+        this._byIdent = new Map()
         this.selected = null
+        this._sort = null // {key, desc}, or null for the log's own order
+        try {
+          this._sort = JSON.parse(localStorage.getItem('log-grid-sort')) || null
+        } catch (e) { }
       }
       connectedCallback() {
         this.appendChild(document.getElementById('log-grid-header').content)
+        this.querySelectorAll('[data-sort]').forEach(h => {
+          h.addEventListener('click', () => this._clickSort(h.dataset.sort))
+        })
+        this._showSort()
         this.addEventListener('keydown', this._onKeyDown.bind(this))
         window.addEventListener('new-data', this._onNewData.bind(this))
         this.classList.toggle('manual', !!document.getElementById('m-conn'))
@@ -37,7 +50,7 @@
       }
       _onKeyDown(evt) {
         const entry = evt.target.closest('log-entry')
-        const idx = this._entries.findIndex(e => e === entry)
+        let idx = this._entries.findIndex(e => e === entry)
         switch (evt.key) {
           case 'ArrowUp': idx--; break
           case 'ArrowDown': idx++; break
@@ -58,7 +71,51 @@
           if (empty) empty.remove()
         }
         evt.detail.forEach(data => { this._updateEntry(data) })
+        this._applySort()
         this._setEntries()
+      }
+      _clickSort(key) {
+        if (!this._sort || this._sort.key !== key) this._sort = { key, desc: false }
+        else if (!this._sort.desc) this._sort.desc = true
+        else this._sort = null
+        try {
+          localStorage.setItem('log-grid-sort', JSON.stringify(this._sort))
+        } catch (e) { }
+        this._showSort()
+        this._applySort()
+        this._setEntries()
+      }
+      // _showSort marks the header(s) of the sorted column with an arrow.
+      _showSort() {
+        this.querySelectorAll('[data-sort]').forEach(h => {
+          const on = this._sort && this._sort.key === h.dataset.sort
+          h.classList.toggle('sort-asc', !!on && !this._sort.desc)
+          h.classList.toggle('sort-desc', !!on && this._sort.desc)
+        })
+      }
+      // _applySort puts the entries in the order of the current sort.  Ties,
+      // and entries with nothing in the sorted column (which go last either
+      // way), are in the log's own order.
+      _applySort() {
+        const entries = Array.from(this.children).filter(e => e instanceof LogEntry)
+        const key = this._sort && sortKeys[this._sort.key]
+        const dir = this._sort && this._sort.desc ? -1 : 1
+        const sorted = entries.slice().sort((a, b) => {
+          if (key) {
+            const ka = key(a.data), kb = key(b.data)
+            if (ka !== kb) {
+              if (ka === '') return 1
+              if (kb === '') return -1
+              return (ka < kb ? -1 : 1) * dir
+            }
+          }
+          return (a.idx - b.idx) * (this._sort && this._sort.key === 'time' ? dir : 1)
+        })
+        if (sorted.every((e, i) => e === entries[i])) return
+        // Moving the focused entry loses the focus; restore it.
+        const focused = document.activeElement
+        sorted.forEach(e => this.appendChild(e))
+        if (focused && focused !== document.activeElement && this.contains(focused)) focused.focus({ preventScroll: true })
       }
       _setEntries() {
         this._entries = []
@@ -70,14 +127,34 @@
         })
       }
       _updateEntry(data) {
-        let entry = this.children.item(data.idx + 2)
+        // Each <log-entry> stays with its log entry (by id), since the
+        // grid's order may not be the log's.
+        let entry = this._byIdent.get(data.id)
         if (!entry) {
           entry = new LogEntry()
           entry.addEventListener('entry-selected', this._onEntrySelected.bind(this))
           this.appendChild(entry)
+          this._byIdent.set(data.id, entry)
         }
         entry.updateData(data)
       }
+    }
+    // sortKeys gives, for each sortable column, a function returning the
+    // value to sort a log entry's data by ('' for nothing to sort by).  The
+    // time column sorts in the log's own order, which is by time.
+    const sortKeys = {
+      time: null,
+      from: d => (d.fc || '').toUpperCase() + '\u0000' + (d.fi || '').toUpperCase(),
+      fromID: d => (d.fi || '').toUpperCase(),
+      localID: d => (d.li || '').toUpperCase(),
+      to: d => (d.tc || '').toUpperCase() + '\u0000' + (d.ti || '').toUpperCase(),
+      toID: d => (d.ti || '').toUpperCase(),
+      subject: d => {
+        let s = d.s || ''
+        if (d.fi && s.startsWith(d.fi + '_')) s = s.substring(d.fi.length + 1)
+        else if (d.ti && s.startsWith(d.ti + '_')) s = s.substring(d.ti.length + 1)
+        return s.toLowerCase()
+      },
     }
   </script>
   <style>
@@ -125,6 +202,24 @@
       grid-row: span 2;
     }
 
+    [data-sort] {
+      cursor: pointer;
+    }
+
+    [data-sort]:hover {
+      text-decoration: underline;
+    }
+
+    .sort-asc::after {
+      content: " ▲";
+      font-size: 0.75em;
+    }
+
+    .sort-desc::after {
+      content: " ▼";
+      font-size: 0.75em;
+    }
+
     #empty-grid {
       grid-column: span var(--columns);
       font-size: 1.25rem;
@@ -139,25 +234,25 @@
   <log-grid></log-grid>
   <template id=log-grid-header>
     <div id=full-header>
-      <div style="grid-row:span 2">
+      <div style="grid-row:span 2" data-sort=time title="Sort by time">
         <div style="display:flex;height:100%;align-items:center">TIME<br>(24:00)</div>
       </div>
       <div style="grid-column:span 2">FROM</div>
       <div style="grid-column:span 2">TO</div>
-      <div style="grid-row:span 2;grid-column:span 2">
+      <div style="grid-row:span 2;grid-column:span 2" data-sort=subject title="Sort by message subject">
         <div style="display:flex;height:100%;align-items:center">Message</div>
       </div>
-      <div>Call Sign/ID</div>
-      <div style="border-left-color:#ddd">Msg #</div>
-      <div>Call Sign/ID</div>
-      <div style="border-left-color:#ddd">Msg #</div>
+      <div data-sort=from title="Sort by sender's call sign">Call Sign/ID</div>
+      <div style="border-left-color:#ddd" data-sort=fromID title="Sort by sender's message number">Msg #</div>
+      <div data-sort=to title="Sort by recipient's call sign">Call Sign/ID</div>
+      <div style="border-left-color:#ddd" data-sort=toID title="Sort by recipient's message number">Msg #</div>
     </div>
     <div id=compact-header>
-      <div>TIME</div>
-      <div style="grid-column: span 2">FROM</div>
-      <div>MSG ID</div>
-      <div style="grid-column: span 2">TO</div>
-      <div style="text-align:left;grid-column:span 2">MESSAGE</div>
+      <div data-sort=time title="Sort by time">TIME</div>
+      <div style="grid-column: span 2" data-sort=from title="Sort by sender">FROM</div>
+      <div data-sort=localID title="Sort by our message number">MSG ID</div>
+      <div style="grid-column: span 2" data-sort=to title="Sort by recipient">TO</div>
+      <div style="text-align:left;grid-column:span 2" data-sort=subject title="Sort by message subject">MESSAGE</div>
     </div>
     <if:manual>
       <div id=empty-grid>

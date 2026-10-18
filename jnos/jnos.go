@@ -82,11 +82,11 @@ type Conn struct {
 	// accessed by the goroutine calling Conn methods; Abort, which may run
 	// on another goroutine, uses aborted instead.
 	err error
-	// msgCount is the number of messages in the current area, according to
-	// the most recent JNOS prompt; msgCountOK is set once there has been
-	// one (see MessageCount).
-	msgCount   int
-	msgCountOK bool
+	// mailCount is the number of messages in the mailbox, according to
+	// JNOS's login banner; mailCountOK is set while it is known to be
+	// good (see MailCount).
+	mailCount   int
+	mailCountOK bool
 }
 
 // Abort ends the connection immediately, without an orderly disconnection from
@@ -162,29 +162,28 @@ func (c *Conn) identIfOK(err *error) {
 	}
 }
 
-// jnosPromptRE is a regular expression matching the JNOS prompt.  Its
-// submatch is the number of messages in the current area.
-var jnosPromptRE = regexp.MustCompile(`^(?:Area: \S+ )?\(#(\d+)\) >$`)
+// jnosPromptRE is a regular expression matching the JNOS prompt.  (The number
+// in it is the current message number, not the number of messages.)
+var jnosPromptRE = regexp.MustCompile(`^(?:Area: \S+ )?\(#\d+\) >$`)
 
-// isPrompt returns whether line is a JNOS prompt.  If it is, it records the
-// number of messages in the current area that the prompt reports.
+// isPrompt returns whether line is a JNOS prompt.
 func (c *Conn) isPrompt(line string) bool {
-	match := jnosPromptRE.FindStringSubmatch(line)
-	if match == nil {
-		return false
-	}
-	if n, err := strconv.Atoi(match[1]); err == nil {
-		c.msgCount, c.msgCountOK = n, true
-	}
-	return true
+	return jnosPromptRE.MatchString(line)
 }
 
-// MessageCount returns the number of messages in the current area, as reported
-// by the most recent JNOS prompt ("Area: ko6nvy (#2) >"), and whether there
-// has been a prompt to report it.  (Messages killed during the session still
-// count until the area is closed.)
-func (c *Conn) MessageCount() (n int, ok bool) {
-	return c.msgCount, c.msgCountOK
+// mailCountRE matches the line in JNOS's login banner that says how many
+// messages are in the mailbox ("You have 2 messages  -  2 new.").  Its submatch
+// is the number.
+var mailCountRE = regexp.MustCompile(`^You have (\d+) messages?\b`)
+
+// MailCount returns the number of messages in the mailbox, as JNOS's login
+// banner reported it, and whether that number is known and still good.  It
+// stops being good if JNOS reports new mail during the session, or the Conn
+// switches to another area.  (Messages killed during the session keep their
+// numbers until the area is closed, so the messages are numbered 1 through
+// the count.)
+func (c *Conn) MailCount() (n int, ok bool) {
+	return c.mailCount, c.mailCountOK
 }
 
 // Connect connects to the JNOS BBS over the supplied open Transport.  If an
@@ -301,6 +300,7 @@ func (c *Conn) SetArea(area string) (err error) {
 	var line string
 
 	defer c.identIfOK(&err)
+	c.mailCountOK = false // the count is for the mailbox we're leaving
 	if err = c.send(fmt.Sprintf("A %s\n", area)); err != nil {
 		return err
 	}
@@ -605,11 +605,18 @@ func (c *Conn) skipLinesUntilPrompt() (err error) {
 		if c.isPrompt(line) {
 			return nil
 		}
+		if match := mailCountRE.FindStringSubmatch(line); match != nil {
+			c.mailCount, _ = strconv.Atoi(match[1])
+			c.mailCountOK = true
+		}
 	}
 }
 
 func (c *Conn) readLine() (response string, err error) {
 	response, err = c.readUntil("\n")
+	if strings.HasPrefix(response, "You have new mail") {
+		c.mailCountOK = false // the count from the banner is out of date
+	}
 	if len(response) != 0 && response[len(response)-1] == '\n' {
 		return response[:len(response)-1], err
 	}

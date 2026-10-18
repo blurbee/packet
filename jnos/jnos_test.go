@@ -410,27 +410,42 @@ func TestCloseReadErrorIsDisconnect(t *testing.T) {
 	}
 }
 
-// TestMessageCount checks that the message count in JNOS prompts is recorded.
-func TestMessageCount(t *testing.T) {
-	c := &Conn{}
-	if _, ok := c.MessageCount(); ok {
-		t.Error("count known before any prompt")
-	}
+// TestMailCount checks that the message count in JNOS's login banner is
+// recorded (not the current message number in the prompt), and that it stops
+// being trusted once new mail arrives or the area changes.
+func TestMailCount(t *testing.T) {
 	for _, tc := range []struct {
-		line   string
-		prompt bool
+		banner string
 		n      int
+		ok     bool
 	}{
-		{"Area: ko6nvy (#0) >", true, 0},
-		{"(#3) >", true, 3},
-		{"Area: xscevent (#12) >", true, 12},
-		{"You have 2 messages.", false, 12},
+		{"You have 2 messages  -  2 new.\nArea: ko6nvy (#1) >\n", 2, true},
+		{"You have 1 message  -  1 new.\nArea: ko6nvy (#1) >\n", 1, true},
+		{"You have 0 messages.\nArea: ko6nvy (#0) >\n", 0, true},
+		{"Welcome\n(#1) >\n", 0, false},
 	} {
-		if got := c.isPrompt(tc.line); got != tc.prompt {
-			t.Errorf("isPrompt(%q) = %v", tc.line, got)
+		f := newFake("[JNOS-2.0-B1FHIM$]\n"+tc.banner, map[string]string{"XM 0\n": "Area: ko6nvy (#1) >\n"})
+		c, err := Connect(f, "")
+		if err != nil {
+			t.Fatalf("Connect: %v", err)
 		}
-		if n, ok := c.MessageCount(); !ok || n != tc.n {
-			t.Errorf("after %q: MessageCount = %d, %v; want %d", tc.line, n, ok, tc.n)
+		if n, ok := c.MailCount(); n != tc.n || ok != tc.ok {
+			t.Errorf("banner %q: MailCount = %d, %v; want %d, %v", tc.banner, n, ok, tc.n, tc.ok)
 		}
+	}
+	// New mail makes the count out of date.
+	f := newFake("[JNOS-2.0-B1FHIM$]\nYou have 1 message  -  1 new.\n(#1) >\n", map[string]string{
+		"XM 0\n": "(#1) >\n",
+		"R 1\n":  "Message #1 \n" + msg5 + "You have new mail.\n(#1) >\n",
+	})
+	c, err := Connect(f, "")
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if _, err = c.Read(1); err != nil {
+		t.Fatalf("Read(1): %v", err)
+	}
+	if _, ok := c.MailCount(); ok {
+		t.Error("count still trusted after new mail arrived")
 	}
 }

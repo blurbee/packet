@@ -479,3 +479,67 @@ func TestBBSExchangeSkipsEmptyMailbox(t *testing.T) {
 		t.Errorf("no orderly disconnect; sent %q", sent)
 	}
 }
+
+// TestBBSExchangeReadsAllMessages checks the case of the 14:44 session: the
+// login banner says the mailbox has 2 messages, while the prompt shows the
+// current message number, 1.  Both messages must be read, and no third one
+// asked for.
+func TestBBSExchangeReadsAllMessages(t *testing.T) {
+	dir := newTestIncident(t)
+	msg := func(n int) string {
+		return fmt.Sprintf("Message #%d \nDate: Sat, 17 Oct 2026 11:58:56 PDT\nFrom: pktmon@w2xsc.scc-ares-races.org\nTo: ko6nvy@w3xsc.scc-ares-races.org\nSubject: Test message %d\n\nHello %d\n\nArea: ko6nvy (#1) >\n", n, n, n)
+	}
+	var subjectNext bool
+	ft := newFakeTransport(func(s string) (string, bool) {
+		// The delivery receipts for the messages read are sent.
+		switch {
+		case strings.HasPrefix(s, "SP "):
+			subjectNext = true
+			return "Subject:\n", false
+		case subjectNext:
+			subjectNext = false
+			return "Enter message.  End with /EX or ^Z in first column (^A aborts):\n", false
+		case strings.HasSuffix(s, "/EX\n"): // the body, sent in one piece
+			return "Msg queued\nArea: ko6nvy (#1) >\n", false
+		}
+		switch s {
+		case "XM 0\n":
+			return "Area: ko6nvy (#1) >\n", false
+		case "R 1\n":
+			return msg(1), false
+		case "R 2\n":
+			return msg(2), false
+		case "K 1\n", "K 2\n":
+			return "Msg " + s[2:3] + " Killed.\nArea: ko6nvy (#1) >\n", false
+		}
+		if strings.HasPrefix(s, "R ") {
+			return "Invalid Message number " + strings.TrimSpace(s[2:]) + "\nArea: ko6nvy (#1) >\n", false
+		}
+		return "", false // includes "B\r": the BBS disconnects
+	})
+	ft.out = "[JNOS-2.0k]\nYou have 2 messages  -  2 new.\nArea: ko6nvy (#1) >\n"
+	useFakeTransport(t, ft)
+	rec := newRecorder(ft)
+	done := make(chan struct{})
+	go func() {
+		BBSExchange(context.Background(), dir, false, rec)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("BBSExchange did not return")
+	}
+	sent := ft.sentCommands()
+	for _, want := range []string{"R 1\n", "K 1\n", "R 2\n", "K 2\n"} {
+		if !slices.Contains(sent, want) {
+			t.Errorf("didn't send %q; sent %q", want, sent)
+		}
+	}
+	if slices.Contains(sent, "R 3\n") {
+		t.Errorf("asked for a third message though the banner said 2; sent %q", sent)
+	}
+	if len(rec.errors) != 0 {
+		t.Errorf("unexpected errors %q", rec.errors)
+	}
+}

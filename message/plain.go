@@ -116,6 +116,8 @@ func (mt plainMessage) EditHTML(msg Message, vars EditHTMLVars) (out []byte, err
 	values.Set("subject", msg.Subject().SubjectSummary())
 	values.Set("body", msg.Body().EncodedBody())
 	htmlop.FillForm(formHTML, values)
+	// Offer to import the message text from a file.
+	htmlop.AddTextImport(formHTML, "body")
 	// Render and minimize the result.
 	htmlop.Minify(&formBuf, formHTML)
 	return formBuf.Bytes(), nil

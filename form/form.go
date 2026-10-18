@@ -399,6 +399,14 @@ func (ft EditableFormType) EditHTML(msg message.Message, vars message.EditHTMLVa
 		}
 	}
 	htmlop.FillForm(formHTML, values)
+	// Offer to import the text of the form's main body field (e.g., the
+	// ICS-213 Message) from a file.
+	for f := range ft.AllFields() {
+		if f.Tag != "" && f.Common == field.CDefaultBody {
+			htmlop.AddTextImport(formHTML, f.Tag)
+			break
+		}
+	}
 	// Render and minimize the result.
 	htmlop.Minify(&formBuf, formHTML)
 	return formBuf.Bytes(), nil

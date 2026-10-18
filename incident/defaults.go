@@ -56,6 +56,10 @@ type IncDefaults struct {
 	// ViewFlags is a bitmask of flags describing how the incident log is
 	// displayed.
 	ViewFlags ViewFlag `json:"viewFlags,omitempty"`
+	// TimeZone is the IANA name of the time zone to use for all incidents
+	// (see SetTimeZone), or empty for the system's time zone.  Unlike the
+	// other fields, it is not taken from an incident's configuration.
+	TimeZone string `json:"timeZone,omitempty"`
 }
 
 // GetIncDefaults retrieves the current incident defaults.  It returns a valid
@@ -106,6 +110,13 @@ func configFromDefaults() (c *Config) {
 // UpdateIncDefaults updates the incident defaults based on the configuration
 // of the receiver incident.  Errors are logged and ignored.
 func (inc *Incident) UpdateIncDefaults() {
+	updateIncDefaults(inc.applyToIncDefaults)
+}
+
+// updateIncDefaults reads the incident defaults, applies fn to them, and saves
+// them, all while holding the write lock on the defaults file.  Errors are
+// logged and ignored.
+func updateIncDefaults(fn func(*IncDefaults)) {
 	var (
 		fname string
 		fh    *os.File
@@ -135,6 +146,24 @@ func (inc *Incident) UpdateIncDefaults() {
 		return
 	}
 	// Update the incident defaults structure.
+	fn(&idef)
+	// Rewind and truncate the file and write the structure.
+	if _, err = fh.Seek(0, 0); err != nil {
+		slog.Error("fh.Seek", "f", fname, "err", err)
+		return
+	}
+	if err = fh.Truncate(0); err != nil {
+		slog.Error("fh.Truncate", "f", fname, "err", err)
+		return
+	}
+	if err = json.MarshalWrite(fh, &idef); err != nil {
+		slog.Error("json.MarshalWrite", "f", fname, "err", err)
+	}
+}
+
+// applyToIncDefaults updates the incident defaults based on the configuration
+// of the receiver incident.
+func (inc *Incident) applyToIncDefaults(idef *IncDefaults) {
 	if inc.Config.OpCall != "" {
 		idef.OpCall = inc.Config.OpCall
 	}
@@ -176,16 +205,4 @@ func (inc *Incident) UpdateIncDefaults() {
 		idef.IncidentDirs = idef.IncidentDirs[len(idef.IncidentDirs)-maxIncidentDirs:]
 	}
 	idef.ViewFlags = inc.Config.ViewFlags
-	// Rewind and truncate the file and write the structure.
-	if _, err = fh.Seek(0, 0); err != nil {
-		slog.Error("fh.Seek", "f", fname, "err", err)
-		return
-	}
-	if err = fh.Truncate(0); err != nil {
-		slog.Error("fh.Truncate", "f", fname, "err", err)
-		return
-	}
-	if err = json.MarshalWrite(fh, &idef); err != nil {
-		slog.Error("json.MarshalWrite", "f", fname, "err", err)
-	}
 }

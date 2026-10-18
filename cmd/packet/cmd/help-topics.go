@@ -8,7 +8,9 @@ Incident Name
 Activation Number
 Operation Start
 Operation End
-    These are text placed at the top of generated ICS-309 communication logs.
+    These are text placed at the top of generated ICS-309 communication logs.  The operational period is in the time zone below.
+Time Zone
+    This is the time zone of the dates and times you enter and see:  an IANA time zone name (e.g., America/Los_Angeles), or empty for the system time zone.  Unlike the other settings, it applies to all incidents.  This software is used by Santa Clara County ARES/RACES, whose operations run on Pacific time (America/Los_Angeles), so it is normally left empty.  Change it only if you are physically in another location, or if your computer's time zone is set to something other than America/Los_Angeles.
 Operator Call Sign
 Operator Name
     These are the FCC call sign and name of the operator running the station. They are used for station identification during the BBS connection, as well as being filled into various forms.

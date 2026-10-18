@@ -34,13 +34,16 @@ func TestConfigMarshal(t *testing.T) {
 func TestConfigUnmarshal(t *testing.T) {
 	var c Config
 
+	// The operational period is read in the local time zone, whatever it
+	// is set to.
+	withTimeZone(t, "America/New_York")
 	if err := json.Unmarshal([]byte(configJSON), &c, json.RejectUnknownMembers(true)); err != nil {
 		t.Fatal(err)
 	}
-	if want := time.Date(2026, 10, 16, 8, 5, 0, 0, time.UTC); !c.OpStart.Equal(want) {
+	if want := time.Date(2026, 10, 16, 8, 5, 0, 0, time.Local); !c.OpStart.Equal(want) || c.OpStart.Location().String() != "America/New_York" {
 		t.Errorf("OpStart = %v, want %v", c.OpStart, want)
 	}
-	if want := time.Date(2026, 10, 17, 20, 0, 0, 0, time.UTC); !c.OpEnd.Equal(want) {
+	if want := time.Date(2026, 10, 17, 20, 0, 0, 0, time.Local); !c.OpEnd.Equal(want) {
 		t.Errorf("OpEnd = %v, want %v", c.OpEnd, want)
 	}
 	for area, cf := range testConfig.BulletinChecks {

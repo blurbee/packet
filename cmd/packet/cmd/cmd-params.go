@@ -416,7 +416,9 @@ MISSING:
 	if err = doEdit(c, i, nil, msg, startf, false, true); err != nil {
 		return err
 	}
-	i.UpdateConfig(msg.Config)
+	if err = msg.Save(i); err != nil {
+		return err
+	}
 	pass2 = true
 	goto RETRY
 }

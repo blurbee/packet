@@ -40,6 +40,13 @@ func (s *Server) serveGetIncidentConfig(w http.ResponseWriter, r *http.Request) 
 	defs = incident.GetIncDefaults()
 	err = incident.Read(r.FormValue("dir"), func(inc *incident.Incident) error {
 		form.Set("dir", inc.Dir)
+		form.Set("timezone", incident.TimeZone())
+		variables["systemzone"] = incident.SystemTimeZone()
+		zones := listedTimeZones
+		if tz := incident.TimeZone(); tz != "" && !slices.Contains(zones, tz) {
+			zones = append(slices.Clone(zones), tz)
+		}
+		variables["timezones"] = strings.Join(zones, ";")
 		form.Set("incname", inc.Config.IncidentName)
 		form.Set("actnum", inc.Config.ActivationNum)
 		if start := inc.Config.OpStart; !start.IsZero() {
@@ -148,9 +155,23 @@ ERROR:
 	s.ErrPage(w, err.Error(), http.StatusInternalServerError)
 }
 
+// listedTimeZones are the time zones offered on the configuration page, along
+// with the system time zone and whichever one is configured.
+var listedTimeZones = []string{
+	"America/Los_Angeles", "America/Denver", "America/Phoenix", "America/Chicago",
+	"America/New_York", "America/Anchorage", "Pacific/Honolulu", "UTC",
+}
+
 func (s *Server) servePostIncidentConfig(w http.ResponseWriter, r *http.Request) {
 	var err error
 
+	r.ParseForm()
+	if tz, ok := r.PostForm["timezone"]; ok {
+		// This comes first, since the operational period is in this zone.
+		if err = incident.SetTimeZone(tz[0]); err != nil {
+			goto ERROR
+		}
+	}
 	err = incident.Write(r.FormValue("dir"), func(inc *incident.Incident) error {
 		var c = inc.Config.Clone()
 

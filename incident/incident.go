@@ -365,6 +365,13 @@ func readStateFile(fname string) (inc *Incident, err error) {
 	if inc.Config == nil {
 		inc.Config = new(Config)
 	}
+	// Show log entry times in the local time zone, even if they were
+	// recorded in another one.
+	for _, le := range inc.Log {
+		if le != nil {
+			le.Time = le.Time.In(time.Local)
+		}
+	}
 	return inc, nil
 }
 

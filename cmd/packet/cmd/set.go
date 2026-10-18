@@ -141,7 +141,9 @@ func cmdSet(args []string) (err error) {
 		case *pseudomsg.LogEntryMessage:
 			i.UpdateLogEntry(entry)
 		case *pseudomsg.ConfigMessage:
-			i.UpdateConfig(msg.Config)
+			if err = msg.Save(i); err != nil {
+				return err
+			}
 		}
 		return nil
 	}); err != nil {

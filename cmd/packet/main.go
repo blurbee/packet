@@ -7,14 +7,17 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	_ "time/tzdata" // so that time zones can be loaded on Windows
 
 	"github.com/rothskeller/packet/v4/cmd/packet/cmd"
 	"github.com/rothskeller/packet/v4/cmd/packet/osdep"
 	"github.com/rothskeller/packet/v4/errors"
+	"github.com/rothskeller/packet/v4/incident"
 )
 
 func main() {
 	reopenLogFile()
+	incident.ApplyTimeZone()
 	logInvocation()
 	defaultCommands()
 	if err := cmd.Run(os.Args[1:]); errors.IsType[cmd.ErrUsage](err) {

@@ -35,6 +35,7 @@ import (
 // messages.
 type ConfigMessage struct {
 	Config   *incident.Config
+	timeZone string
 	startstr string
 	endstr   string
 	defrx    bool
@@ -46,7 +47,7 @@ var _ message.Message = (*ConfigMessage)(nil)
 
 // NewConfigMessage constructs a ConfigMessage for a Config.
 func NewConfigMessage(c *incident.Config) (cm *ConfigMessage) {
-	cm = &ConfigMessage{Config: c}
+	cm = &ConfigMessage{Config: c, timeZone: incident.TimeZone()}
 	if !c.OpStart.IsZero() {
 		cm.startstr = c.OpStart.Format("01/02/2006 15:04")
 	}
@@ -90,6 +91,22 @@ func (cm *ConfigMessage) Fields() iter.Seq[field.Field] {
 				EditWidth(ics309FieldWidth("ActivationNum")).
 				SetValueFunc(func(m message.Message, s string) {
 					m.(*ConfigMessage).Config.ActivationNum = s
+				}).
+				MakeField(),
+			field.NewField("", "Time Zone").
+				ValueFunc(func(m message.Message) string {
+					return m.(*ConfigMessage).timeZone
+				}).
+				EditHelp(`This is the time zone of the dates and times you enter and see, such as the operational period, log entry times, and message dates and times.  It is an IANA time zone name, such as "America/Los_Angeles", or empty for the system time zone (` + incident.SystemTimeZone() + `).  It applies to all incidents, not just this one.  This software is used by Santa Clara County ARES/RACES, whose operations run on Pacific time (America/Los_Angeles), so this is normally left empty.  Change it only if you are physically in another location, or if your computer's time zone is set to something other than America/Los_Angeles.`).
+				EditWidth(30).
+				SetValueFunc(func(m message.Message, s string) {
+					m.(*ConfigMessage).timeZone = s
+				}).
+				ValidateFunc(func(m message.Message, f field.Field, vf message.ValidateFlags) error {
+					if _, err := incident.LoadTimeZone(m.(*ConfigMessage).timeZone); err != nil {
+						return NoBypassValidationError{err}
+					}
+					return nil
 				}).
 				MakeField(),
 			field.NewField("", "Operation Start").
@@ -497,6 +514,16 @@ func (cm *ConfigMessage) Fields() iter.Seq[field.Field] {
 		}
 	})
 	return slices.Values(configFields)
+}
+
+// Save applies the configuration to the incident, and the time zone (which is
+// for all incidents) to the program.
+func (cm *ConfigMessage) Save(i *incident.Incident) error {
+	if err := incident.SetTimeZone(cm.timeZone); err != nil {
+		return err
+	}
+	i.UpdateConfig(cm.Config)
+	return nil
 }
 
 var endsNumericRE = regexp.MustCompile(`\d\d\d$`)

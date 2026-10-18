@@ -227,7 +227,9 @@ LOOP: // Run the editor loop.
 	case *pseudomsg.LogEntryMessage:
 		i.UpdateLogEntry(entry)
 	case *pseudomsg.ConfigMessage:
-		i.UpdateConfig(msg.Config)
+		if err = msg.Save(i); err != nil {
+			return err
+		}
 	}
 	// Notify the user if we took the message out of the queue.
 	if wasQueued && !msg.(*message.DraftMessage).ReadyToSend() {

@@ -159,7 +159,8 @@ func ParseViewFlags(s string) (f ViewFlag, err error) {
 }
 
 // An OpTime is a time stored in JSON with minute precision and no time zone,
-// e.g. "2006-01-02T15:04".  When read back, it is in UTC.
+// e.g. "2006-01-02T15:04".  It is read back in the local time zone (see
+// SetTimeZone), as it was entered.
 type OpTime struct {
 	time.Time
 }
@@ -181,7 +182,7 @@ func (t *OpTime) UnmarshalJSONFrom(dec *jsontext.Decoder) (err error) {
 		t.Time = time.Time{}
 		return nil
 	case '"':
-		t.Time, err = time.Parse(opTimeLayout, tok.String())
+		t.Time, err = time.ParseInLocation(opTimeLayout, tok.String(), time.Local)
 		return err
 	default:
 		return errors.New("operational period time must be a string")

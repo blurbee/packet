@@ -582,7 +582,7 @@
   <form method=POST>
     <input type=hidden name=viewflags>
     <div class="form-grid borders-inside"
-      style="grid: 'title title' 'A A' 'B B' 'C C' 'D H' 'E H' 'F H' 'G H'/max-content 1fr">
+      style="grid: 'title title' 'A A' 'B B' 'C C' 'T T' 'D H' 'E H' 'F H' 'G H'/max-content 1fr">
       <div class="border tblr title" style="grid-area: title">Incident Settings</div>
       <div class="form-grid container subgrid2 border tblr" style="grid-area: A">
         <label for=dir>Incident Directory:</label>
@@ -605,6 +605,28 @@
         <help for=actnum>
           This is the activation number assigned by the agency that activated you, if any.
           You can generally find this on the ICS-205 given out at the assignment briefing.
+        </help>
+      </div>
+      <div class="form-grid container subgrid2 border tblr" style="grid-area: T">
+        <label for=timezone>Time Zone:</label>
+        <div>
+          <select id=timezone name=timezone>
+            <option value="">System time zone ({{systemzone}})</option>
+            <for:timezones>
+              <option value={{.}}>{{.}}</option>
+            </for:timezones>
+          </select>
+        </div>
+        <help for=timezone>
+          This is the time zone of the dates and times you enter and see, such as the operational period, log entry
+          times, and message dates and times.
+          It applies to all incidents, not just this one.
+          This software is used by Santa Clara County ARES/RACES, whose operations run on Pacific time
+          (America/Los_Angeles), so it is normally left at the system time zone.
+          Change it only if you are physically in another location, or if your computer's time zone is set to
+          something other than America/Los_Angeles.
+          (Any IANA time zone name can be set with the command line, e.g.,
+          packet set configuration "Time Zone" America/Los_Angeles.)
         </help>
       </div>
       <div class="form-grid container subgrid2 border tblr" style="grid-area: D">

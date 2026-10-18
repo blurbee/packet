@@ -207,3 +207,47 @@ func (s *Server) serveViewICS309(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 }
+
+// serveGetIncidentArchive handles GET /incident-archive requests, which have
+// dir= and format= ("pdf" or "txt") parameters.  It generates the incident
+// archive if it doesn't already exist, and returns it in the requested format
+// (inline, for viewing).
+func (s *Server) serveGetIncidentArchive(w http.ResponseWriter, r *http.Request) {
+	var (
+		dir   string
+		fname string
+		file  = incident.ArchivePDFFile
+		ctype = "application/pdf"
+	)
+	if r.FormValue("format") == "txt" {
+		file, ctype = incident.ArchiveTextFile, "text/plain; charset=utf-8"
+	}
+	s.serveIncident(w, r, false, func(i *incident.Incident) (err error) {
+		dir = i.Dir
+		fname = "Archive"
+		if i.Config.ActivationNum != "" {
+			fname += " " + i.Config.ActivationNum
+		}
+		if i.Config.TacCall != "" {
+			fname += " " + i.Config.TacCall
+		} else if i.Config.OpCall != "" {
+			fname += " " + i.Config.OpCall
+		}
+		if !i.Config.OpStart.IsZero() {
+			fname += i.Config.OpStart.Format(" 2006-01-02")
+		}
+		fname += filepath.Ext(file)
+		return i.GenerateArchive()
+	}, func() error {
+		fh, err := os.Open(filepath.Join(dir, file))
+		if err != nil {
+			return err
+		}
+		defer fh.Close()
+		w.Header().Set("Content-Type", ctype)
+		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", fname))
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeContent(w, r, file, time.Time{}, fh)
+		return nil
+	})
+}

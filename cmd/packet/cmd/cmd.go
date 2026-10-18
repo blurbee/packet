@@ -57,6 +57,8 @@ func run(args []string) (err error) {
 		return cmdHelp(args[1:])
 	case "ics309", "309":
 		return cmdICS309(args[1:])
+	case "archive":
+		return cmdArchive(args[1:])
 	case "import":
 		return cmdImport(args[1:])
 	case "list", "l", "ls", "log":

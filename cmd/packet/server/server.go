@@ -387,6 +387,7 @@ func (s *Server) registerHandlers() {
 	s.mux.HandleFunc("POST /delete-message", s.gui(s.servePostDeleteMessage))
 	s.mux.HandleFunc("GET /view-encoded", s.gui(s.serveGetViewEncoded))
 	s.mux.HandleFunc("/view-ics309", s.gui(s.serveViewICS309))
+	s.mux.HandleFunc("GET /incident-archive", s.gui(s.serveGetIncidentArchive))
 	s.mux.HandleFunc("GET /manpage.html", s.gui(s.serveGetManPage))
 	s.mux.HandleFunc("/incident-open", s.gui(s.serveIncidentOpen))
 	s.mux.HandleFunc("GET /county-seal.svg", s.serveGetCountySeal)

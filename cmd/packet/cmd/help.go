@@ -13,6 +13,7 @@ const topHelp = `
 The "packet" command provides multiple commands for handling packet radio messages.  When invoked with a command on the command line, it runs that command.  When invoked without any arguments, it starts a shell that allows running multiple commands without the "packet" prefix on each.
 
 Available commands include:
+  archive  ⇥` + archiveSlug + `
   cd       ⇥` + chdirSlug + `
   connect  ⇥` + connectSlug + `
   delete   ⇥` + deleteSlug + `
@@ -79,6 +80,8 @@ func cmdHelp(args []string) (err error) {
 			helpText = guiHelp
 		case "ics309", "309":
 			helpText = ics309Help
+		case "archive":
+			helpText = archiveHelp
 		case "import":
 			helpText = importHelp
 		case "list", "l", "ls", "log":

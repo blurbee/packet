@@ -99,8 +99,16 @@
         id: 'm-inc-ics-309',
         clicked: () => { openSignICS309Dialog() }
       })
-      // Incident: Archive
-      // TODO:
+      // Incident: Message Archive (PDF, Text)
+      for (const format of ['pdf', 'txt']) {
+        setupMenuItem({
+          id: `m-inc-archive-${format}`,
+          clicked: () => {
+            const params = new URLSearchParams({ dir: document.body.dataset.dir, format })
+            window.open('/incident-archive?' + params.toString(), '_blank')
+          }
+        })
+      }
       // Message: New
       setupMenuItem({
         id: 'm-msg-new',

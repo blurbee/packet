@@ -495,6 +495,19 @@
       "ics309.pdf" in the incident folder, and will be shown in the system
       default PDF viewer.
     </p>
+    <p>
+      To see every sent and received message of the incident in one
+      document, use the Incident → Message Archive (PDF) or Message Archive
+      (Text) menu item in the graphical interface, or the
+      <code>archive</code> command (with <code>--text</code> for the text
+      version) in the command line interface. The archive contains the
+      messages, and any hand-entered log entries, in log order; drafts are
+      not included. The PDF archive combines the messages' PDFs (receipts
+      have none), and the text archive has each message's text, receipts
+      included. The archive is created in the files "all.pdf" and "all.txt"
+      in the incident folder, and is removed whenever the incident changes,
+      so it is never out of date.
+    </p>
     <h3 id=sending>Sending Messages</h3>
     <p>To create a draft of an outgoing message:</p>
     <ul>

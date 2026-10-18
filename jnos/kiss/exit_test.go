@@ -98,9 +98,13 @@ func TestSessionMarker(t *testing.T) {
 		client, server := net.Pipe()
 		defer server.Close()
 		b := newFakeBBS(t, server)
+		opened := make(chan struct{})
 		go func() {
 			b.accept()
 			if clean {
+				// Disconnect only once the connection is open, so that
+				// it isn't the connect that sees the disconnect.
+				<-opened
 				b.disconnect()
 			} else {
 				// The BBS drops us once we send something.
@@ -116,6 +120,7 @@ func TestSessionMarker(t *testing.T) {
 		}()
 		withMarker := func(t *Transport) { t.marker = marker }
 		tr, err := open(client, testDevice, testClient, testBBS, nil, nil, withRadio(radio, &reopened), withMarker)
+		close(opened)
 		if err != nil {
 			t.Fatal(err)
 		}
